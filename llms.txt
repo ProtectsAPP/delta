@@ -1,0 +1,1031 @@
+# Delta — LLM developer tutorial (no SDK required)
+
+> Delta is a single-binary multi-model database: documents + vectors +
+> Redis-style cache + RBAC + replication. It exposes the **same logical API**
+> over three transports on three ports:
+>
+> * `deltaql://<host>:16889` — **the recommended way for any non-trivial
+>   client.** A persistent, stateful, multiplexed binary protocol — the
+>   MySQL-equivalent for Delta. Connect once, log in once, then fire any
+>   number of requests AND receive server-pushed pubsub messages on the
+>   exact same socket forever. No per-request TCP/HTTP setup tax. No
+>   re-authentication. ~2–6× the throughput of HTTP-per-request.
+> * `ws://<host>:16890` — the same persistent protocol, but each frame is
+>   a JSON text message. This is the deltaql:// variant browsers can speak.
+> * `http://<host>:16888` — plain REST. Use this for one-off `curl`
+>   commands, scripts that fire one or two requests, or anywhere that
+>   can't keep a long-lived socket. Every request pays a TCP+HTTP setup
+>   cost, and you have to attach the `Authorization` header to every call.
+>
+> **Rule of thumb:** if your agent will issue more than ~10 requests, or
+> wants live pubsub, **open one `deltaql://` (or `ws://`) connection and
+> reuse it for the whole session.** Don't open a new connection per
+> request — that defeats the entire point.
+>
+> This file is the source of truth. It is fetchable from any running
+> Delta server at `GET /llms.txt`, and from
+> <https://raw.githubusercontent.com/ProtectsAPP/delta/main/llms.txt>.
+
+---
+
+## 1 · Pick your transport
+
+| Use case                                               | Transport          | Pattern |
+| ------------------------------------------------------ | ------------------ | ------- |
+| Backend service, agent, daemon, anything long-lived    | `deltaql://:16889` | **One persistent connection per process** |
+| Browser, mobile, edge runtime, anything with no raw TCP | `ws://:16890`     | One persistent WebSocket per page/session |
+| One-off curl, migration script, ad-hoc shell snippet   | `http://:16888`    | Per-request HTTP (re-send `Authorization` each time) |
+
+All three transports share the **same JSON shapes** for every endpoint —
+filters, update operators, response envelopes are identical. The only
+differences are framing and how you carry the auth token.
+
+The response envelope is always:
+
+```json
+{ "code": 200, "data": { ... }, "message": "..." }
+```
+
+* `code` is the Delta `Status` enum, **not** the HTTP status:
+  `OK=0 ERROR=1 NOT_FOUND=2 DUPLICATE=3 INVALID=4 UNAUTHORIZED=5 FORBIDDEN=6 INTERNAL=7`.
+* On error, `data` is `null` and `message` carries the reason.
+* List endpoints wrap items: `data.users`, `data.documents`, `data.items`,
+  `data.members`, `data.collections`, `data.roles`. Always read the key,
+  not just `data`.
+
+Default credentials: `admin / admin` (change immediately in production).
+
+---
+
+## 2 · The persistent connection — `deltaql://`
+
+This is **the** way to use Delta. It is a real persistent stateful TCP
+connection — the direct equivalent of a MySQL connection — except:
+
+* multi-request multiplexed (many requests in flight on one socket,
+  correlated by a 32-bit `rid`) — MySQL can't do this
+* server-push pubsub on the same socket — MySQL can't do this either
+* one TCP+JSON handshake instead of MySQL's binary handshake +
+  capability flags + per-statement prepare; same persistence guarantees
+
+The server holds these per-connection (verified in `src/network/deltaql_server.hpp`):
+
+| Per-connection state | What it does |
+| --- | --- |
+| `int fd_`              | the TCP socket; lives until you close it or send `BYE` |
+| `std::string token_`   | sticky auth — set once on AUTH, auto-injected into every REQUEST |
+| `std::set<std::string> subs_` | your channel subscriptions; PUBLISH frames are pushed to you whenever anyone publishes |
+| reader thread          | parses incoming frames |
+| writer thread          | serializes outgoing frames so concurrent responses don't interleave |
+
+So: you do not need to install any SDK and you do not need to "manage a
+connection pool" — you literally just open one socket per process and
+keep it alive. The 80-line Python class in §2.2 below **is** your
+client. Copy it into your project verbatim.
+
+Pseudocode of the lifecycle:
+
+```
+open one TCP socket to host:16889       (once, at process start)
+  → HELLO  { "client": "your-agent/1.0" }
+  → AUTH   { "username": "admin", "password": "admin" }
+       (server stores the token on this connection — sticky for life of socket)
+
+for as long as your process runs:
+  → REQUEST { method, path, body, ... }      ← every API call goes here
+  ← RESPONSE { status, body }                  (correlated by `rid`)
+
+  → SUB     { channel: "trades" }             ← optional: subscribe to pubsub
+  ← PUBLISH { channel, message }              (server-push, any time)
+  ← PUBLISH { channel, message }
+  ...
+
+→ BYE                                          (graceful shutdown)
+close socket
+```
+
+Key properties:
+
+* **Sticky auth.** AUTH happens **once**. The server attaches your token
+  to the connection and auto-injects it into every subsequent REQUEST.
+  You never re-send `Authorization`.
+* **Multiplexed.** Every frame carries a 32-bit `rid`. You can have
+  thousands of REQUESTs in flight at once and match responses by `rid` —
+  no head-of-line blocking like HTTP/1.1.
+* **Live pubsub on the same socket.** SUB once, then PUBLISH frames
+  arrive whenever someone (anywhere) calls `POST /api/v1/pubsub/publish`.
+  No polling, no second connection.
+* **TCP_NODELAY + SO_KEEPALIVE** are set by the server. The connection
+  stays alive across NAT idle timeouts as long as you send something
+  every few minutes (a PING frame is enough).
+* **Graceful close.** Send a `BYE` frame, then close. The server flushes
+  pending RESPONSE frames first.
+
+### 2.1 Frame format (so you can write a client in any language)
+
+```
+16-byte header (big-endian)
++-----------+-----+-------+-------+-------+----------+----------+
+|  "DLTA"   | ver | flags | type  | rsvd  |    rid   |    len   |
+|   4 B     |  1  |   1   |   1   |   1   |    4 B   |    4 B   |
++-----------+-----+-------+-------+-------+----------+----------+
+ then `len` bytes of UTF-8 JSON payload
+```
+
+* `magic` is always the four bytes `0x44 0x4C 0x54 0x41` (`"DLTA"`).
+* `ver = 1`, `flags = 0` (reserved for future compression).
+* `len ≤ 64 MiB`.
+* `rid` is client-assigned. The server echoes the same `rid` in the
+  matching `RESPONSE` or `ERROR` frame. `PUBLISH` frames use `rid = 0`.
+
+Frame `type` byte:
+
+```
+client → server                     server → client
+  0x01 HELLO                          0x02 HELLO_OK
+  0x03 AUTH                           0x04 AUTH_OK
+  0x05 REQUEST                        0x06 RESPONSE
+                                      0x07 ERROR
+  0x08 PING                           0x09 PONG
+  0x0A SUB
+  0x0B UNSUB
+                                      0x0C PUBLISH
+  0x0F BYE
+```
+
+Payload schemas (all UTF-8 JSON):
+
+```json
+HELLO    { "client": "name/version" }
+AUTH     { "username": "admin", "password": "admin" }
+         or { "token": "<existing-token>" }     // resume an existing session
+REQUEST  { "method":"POST", "path":"/api/v1/...",
+           "query": {...}, "headers": {...}, "body": {...} }
+RESPONSE { "status": 200, "body": {<envelope>} }
+ERROR    { "code": -1, "message": "..." }
+SUB      { "channel": "..." }
+UNSUB    { "channel": "..." }
+PUBLISH  { "channel": "...", "message": "..." }    // server → client only
+PING / PONG / BYE   {}
+```
+
+### 2.2 Minimal Python client — copy this verbatim
+
+This is a complete, production-shaped client in ~70 lines. Reuse one
+`Delta` instance for the whole life of your process — it holds the
+single multiplexed socket.
+
+```python
+import json, socket, struct, threading
+from itertools import count
+from queue import Queue, Empty
+
+_HDR = struct.Struct(">4sBBBBII")          # magic ver flg typ rsv rid len
+_MAGIC = b"DLTA"
+
+class Delta:
+    """One persistent multiplexed connection to deltaql://host:16889.
+
+    Open once, call .auth() once, then call .request() / .subscribe()
+    as many times as you like for the lifetime of your process.
+    Thread-safe — many threads may call request() concurrently and the
+    rid-correlated reader thread routes each response back to its caller.
+    """
+    # Frame types we care about
+    HELLO, HELLO_OK = 0x01, 0x02
+    AUTH,  AUTH_OK  = 0x03, 0x04
+    REQUEST, RESPONSE, ERROR = 0x05, 0x06, 0x07
+    PING, PONG               = 0x08, 0x09
+    SUB,  UNSUB,    PUBLISH  = 0x0A, 0x0B, 0x0C
+    BYE                      = 0x0F
+
+    def __init__(self, host="127.0.0.1", port=16889, timeout=30):
+        self.s = socket.create_connection((host, port), timeout=timeout)
+        self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self._rid = count(1)
+        self._pending: dict = {}              # rid → Queue (response slot)
+        self._subs: dict   = {}               # channel → callback
+        self._wlock = threading.Lock()
+        threading.Thread(target=self._read_loop, daemon=True).start()
+        # HELLO is fire-and-forget — server replies with HELLO_OK which
+        # the reader simply ignores. No need to block on it.
+        self._send(self.HELLO, {"client": "py-llm/1.0"})
+
+    # ---- public API -------------------------------------------------
+    def auth(self, username, password):
+        # AUTH returns a normal RESPONSE envelope carrying the token.
+        env = self._call(self.AUTH, {"username": username, "password": password})
+        return env["body"]                                 # → data.token, ...
+
+    def request(self, method, path, body=None, query=None, headers=None):
+        payload = {"method": method.upper(), "path": path}
+        if body is not None:    payload["body"]    = body
+        if query:               payload["query"]   = query
+        if headers:             payload["headers"] = headers
+        env = self._call(self.REQUEST, payload)
+        b = env.get("body", env)
+        if isinstance(b, dict) and isinstance(b.get("code"), int) and b["code"] >= 400:
+            raise RuntimeError(b.get("message", "delta error"))
+        return b["data"] if isinstance(b, dict) and "data" in b else b
+
+    def subscribe(self, channel, callback):
+        self._subs[channel] = callback
+        self._call(self.SUB, {"channel": channel})
+
+    def unsubscribe(self, channel):
+        self._subs.pop(channel, None)
+        self._call(self.UNSUB, {"channel": channel})
+
+    def ping(self): self._call(self.PING, {})
+
+    def close(self):
+        try: self._send(self.BYE, {})
+        except Exception: pass
+        self.s.close()
+
+    # ---- wire plumbing ---------------------------------------------
+    def _send(self, ftype, payload):
+        rid = next(self._rid)
+        body = json.dumps(payload).encode()
+        with self._wlock:
+            self.s.sendall(_HDR.pack(_MAGIC, 1, 0, ftype, 0, rid, len(body)) + body)
+        return rid
+
+    def _call(self, ftype, payload, timeout=30):
+        rid = next(self._rid)
+        q: Queue = Queue(1); self._pending[rid] = q
+        body = json.dumps(payload).encode()
+        with self._wlock:
+            self.s.sendall(_HDR.pack(_MAGIC, 1, 0, ftype, 0, rid, len(body)) + body)
+        try:    return q.get(timeout=timeout)
+        finally: self._pending.pop(rid, None)
+
+    def _read_loop(self):
+        while True:
+            try: hdr = self._read_n(16)
+            except Exception: return
+            if not hdr: return
+            magic, _ver, _flg, typ, _rsv, rid, n = _HDR.unpack(hdr)
+            if magic != _MAGIC: return
+            payload = self._read_n(n) if n else b""
+            try: msg = json.loads(payload or b"{}")
+            except Exception: msg = {}
+            if typ == self.PUBLISH:                # server-push: deliver to callback
+                cb = self._subs.get(msg.get("channel"))
+                if cb:
+                    try: cb(msg.get("channel"), msg.get("message"))
+                    except Exception: pass
+                continue
+            if typ in (self.HELLO_OK, self.AUTH_OK, self.PONG):
+                # HELLO_OK / AUTH_OK / PONG are informational. The token
+                # is already inside the RESPONSE envelope we returned to
+                # auth(). Skipping these prevents stray frames from
+                # filling the next caller's slot.
+                continue
+            q = self._pending.get(rid)
+            if q is not None:
+                q.put(msg)
+
+    def _read_n(self, k):
+        buf = b""
+        while len(buf) < k:
+            chunk = self.s.recv(k - len(buf))
+            if not chunk: return b""
+            buf += chunk
+        return buf
+```
+
+Use it like a database handle — **one instance, many calls**:
+
+```python
+db = Delta("127.0.0.1", 16889)
+db.auth("admin", "admin")                                     # ← once
+
+# All of these reuse the same socket. Sticky auth means no re-login.
+print(db.request("GET",  "/api/v1/health"))
+print(db.request("POST", "/api/v1/use", body={"database":"shop","schema":"public"}))
+
+orders = "/api/v1/collections/orders/documents"
+db.request("POST", orders, body={"_id":"o1","user_id":"u1","total":12.5})
+print(db.request("POST", "/api/v1/collections/orders/documents/search",
+                 body={"filter": {"total": {"$gt": 10}}, "limit": 50}))
+
+# Live pubsub — server pushes onto the same socket
+db.subscribe("trades", lambda ch, msg: print("push:", ch, msg))
+db.request("POST", "/api/v1/pubsub/publish",
+           body={"channel":"trades","message":"hello"})
+
+# When the process exits:
+db.close()
+```
+
+That's it. No connection pool, no re-auth, no HTTP overhead. The
+connection sits there as long as your process is alive, multiplexing
+every operation including server push.
+
+---
+
+## 3 · Browser / WebSocket version
+
+Browsers can't open raw TCP sockets, so use `ws://<host>:16890/` — same
+protocol, JSON-text frames. Open it once at session start, reuse forever.
+
+```js
+class Delta {
+  constructor(url = "ws://127.0.0.1:16890/") {
+    this.url = url;
+    this.ws = null;
+    this.rid = 0;
+    this.pending = new Map();           // rid → {resolve, reject}
+    this.subs = new Map();              // channel → callback
+  }
+
+  async connect() {
+    return new Promise((resolve, reject) => {
+      this.ws = new WebSocket(this.url);
+      this.ws.onopen = () => {
+        this._send({ type: "hello", rid: ++this.rid, client: "js-llm/1.0" });
+        resolve();
+      };
+      this.ws.onmessage = ev => this._onMessage(JSON.parse(ev.data));
+      this.ws.onerror = e => reject(e);
+      this.ws.onclose = () => { for (const p of this.pending.values()) p.reject(new Error("closed")); };
+    });
+  }
+
+  // sticky auth — call ONCE, the server keeps the token attached forever.
+  async auth(username, password) {
+    return this._call({ type: "auth", username, password });
+  }
+
+  async request(method, path, body, query, headers) {
+    return this._call({ type: "request", method, path,
+                        ...(body ? {body} : {}),
+                        ...(query ? {query} : {}),
+                        ...(headers ? {headers} : {}) });
+  }
+
+  // server-push pubsub on the SAME socket — no polling, no second connection.
+  async subscribe(channel, callback) {
+    this.subs.set(channel, callback);
+    return this._call({ type: "subscribe", channel });
+  }
+  async unsubscribe(channel) {
+    this.subs.delete(channel);
+    return this._call({ type: "unsubscribe", channel });
+  }
+
+  close() { this._send({ type: "bye" }); this.ws.close(); }
+
+  // ---- internals ----
+  _send(frame) { this.ws.send(JSON.stringify({ rid: ++this.rid, ...frame })); }
+  _call(frame) {
+    const rid = ++this.rid;
+    return new Promise((resolve, reject) => {
+      this.pending.set(rid, { resolve, reject });
+      this.ws.send(JSON.stringify({ rid, ...frame }));
+    });
+  }
+  _onMessage(m) {
+    if (m.type === "publish") {
+      const cb = this.subs.get(m.channel);
+      if (cb) cb(m.channel, m.message);
+      return;
+    }
+    const p = this.pending.get(m.rid);
+    if (!p) return;
+    this.pending.delete(m.rid);
+    if (m.type === "error") p.reject(new Error(m.message ?? "delta error"));
+    else                    p.resolve(m.body ?? m);
+  }
+}
+
+// --- usage --------------------------------------------------------
+const db = new Delta();
+await db.connect();
+await db.auth("admin", "admin");                  // ← once
+
+await db.request("POST", "/api/v1/use",
+                 { database: "shop", schema: "public" });
+
+await db.request("POST", "/api/v1/collections/orders/documents",
+                 { _id: "o1", user_id: "u1", total: 12.5 });
+
+await db.subscribe("trades", (ch, msg) => console.log("push:", ch, msg));
+await db.request("POST", "/api/v1/pubsub/publish",
+                 { channel: "trades", message: "hello" });
+```
+
+The body of every `request(...)` call is **identical** to the body you'd
+POST over plain HTTP — same JSON, same field names. Once you know the
+endpoint catalog (§5–§14 below), you know both transports.
+
+---
+
+## 4 · Quick HTTP fallback (for one-off scripts only)
+
+For `curl`, migrations, or anywhere a long-lived socket isn't practical.
+Each request pays a TCP+HTTP setup cost (≈100–300 µs locally, much more
+over the network) and you must attach `Authorization` to every call.
+
+### Login → token
+
+```bash
+TOKEN=$(curl -s -X POST http://127.0.0.1:16888/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin"}' | jq -r .data.token)
+
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:16888/api/v1/auth/me
+```
+
+### Switch active database/schema for this token
+
+```bash
+curl -X POST http://127.0.0.1:16888/api/v1/use \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"database":"shop","schema":"public"}'
+```
+
+After `/use`, all collection routes default to `shop.public.*`. You can
+override per request with `?database=...&schema=...` query params or per
+body (`{"database":"...","schema":"..."}`).
+
+### How the same call looks across all three transports
+
+In the deltaql:// and ws:// rows below, `db` is the persistent-connection
+class you copied from §2.2 (Python) or §3 (browser). It is **not** an
+external SDK — it is a few dozen lines of code that lives inside your
+own project.
+
+| Transport     | What you send                                                                                            |
+| ------------- | -------------------------------------------------------------------------------------------------------- |
+| `deltaql://`  | `db.request("POST", "/api/v1/collections/users/documents", body={"_id":"u1","email":"a@b.c"})`           |
+| `ws://`       | `await db.request("POST", "/api/v1/collections/users/documents", { _id:"u1", email:"a@b.c" })`           |
+| `http://`     | `curl -X POST -H "Authorization: Bearer $T" -d '{"_id":"u1","email":"a@b.c"}' .../api/v1/collections/users/documents` |
+
+Every endpoint below shows the body. **Use the same body inside a
+`REQUEST` frame on a persistent connection** — that is always the
+preferred form.
+
+---
+
+## 5 · Health / stats / status (no auth)
+
+```bash
+GET /api/v1/health      → {"data":{"ok":true}}
+GET /api/v1/stats       → server, storage, cache, vector, requests_per_sec, uptime, ...
+GET /api/v1/status
+GET /api/v1/auth/me     (auth required)
+```
+
+---
+
+## 6 · Databases & schemas
+
+```
+GET    /api/v1/databases                            list
+POST   /api/v1/databases                {"name":"shop","comment":"..."}
+GET    /api/v1/databases/{db}
+PATCH  /api/v1/databases/{db}           {"comment":"..."}
+DELETE /api/v1/databases/{db}
+GET    /api/v1/databases/{db}/schemas
+POST   /api/v1/databases/{db}/schemas   {"name":"tenant_42"}
+DELETE /api/v1/databases/{db}/schemas/{schema}
+```
+
+---
+
+## 7 · Collections & indexes
+
+Collections are schemaless documents+vectors namespaces. Only `name` is
+required. Optional: `database`, `schema` (= namespace, NOT field types),
+`indexes`.
+
+```
+GET    /api/v1/collections                          list (in current db)
+POST   /api/v1/collections        {
+    "name": "orders",
+    "indexes": [
+      {"name":"by_user",  "fields":["user_id"]},
+      {"name":"uniq_ext", "fields":["external_id"], "unique": true}
+    ]
+  }
+GET    /api/v1/collections/{c}
+PATCH  /api/v1/collections/{c}                      alter
+DELETE /api/v1/collections/{c}
+POST   /api/v1/collections/{c}/indexes              {"name":..., "fields":[...], "unique":bool}
+DELETE /api/v1/collections/{c}/indexes/{name}
+```
+
+---
+
+## 8 · Documents
+
+A document is JSON. `_id` is auto-assigned if you omit it (returned in
+`data.id` on insert). On the wire user fields live under `data.data`;
+look for your fields under `record.data` and merge them with the
+top-level metadata client-side. The Python `Delta` class in §2.2 already
+does this for you when you call `db.request(...)` because the server
+response envelope is returned as-is — see the example after §2.2 for
+the exact shape.
+
+```
+POST   /api/v1/collections/{c}/documents              {...doc}
+POST   /api/v1/collections/{c}/documents/bulk         {"documents":[...]}
+GET    /api/v1/collections/{c}/documents/{id}
+PATCH  /api/v1/collections/{c}/documents/{id}         {"$set":{...},"$inc":{...}}    ← MUST use operators
+DELETE /api/v1/collections/{c}/documents/{id}
+POST   /api/v1/collections/{c}/documents/search       {filter, sort?, limit?, skip?, fields?}
+POST   /api/v1/collections/{c}/count                  {filter}
+POST   /api/v1/collections/{c}/aggregate              {pipeline:[{$match}, {$group}, ...]}
+```
+
+### 8.1 Filter operators (search · count · `$match`)
+
+```
+{ "field": value }                          equality
+{ "field": { "$eq":  v } }                  ($ne, $gt, $gte, $lt, $lte)
+{ "field": { "$in":  [...] } }              ($nin)
+{ "field": { "$exists":   true } }
+{ "field": { "$regex":    "^a" } }          ECMA regex against stringified value
+{ "field": { "$contains": "abc" } }         substring or array-includes
+{ "$and": [ {...}, {...} ] }                ($or, $nor, $not)
+```
+
+Sort: `{"field": 1}` ascending, `{"field": -1}` descending. Multiple
+keys honored in object-insertion order.
+
+### 8.2 Update operators (PATCH body)
+
+```
+{ "$set":      { "f": v, "nested.key": v } }
+{ "$unset":    { "f": true } }
+{ "$inc":      { "score": 1 } }       negative for decrement
+{ "$mul":      { "price": 1.1 } }
+{ "$push":     { "tags": "x" } }
+{ "$pull":     { "tags": "x" } }
+{ "$addToSet": { "tags": "x" } }
+{ "$rename":   { "old": "new" } }
+```
+
+A bare object does **not** replace the document. You must use operators.
+
+### 8.3 Aggregation pipeline stages
+
+```
+{ "$match":  { ...filter... } }
+{ "$group":  { "_id": "field",
+               "out": {"$sum": "src"},
+               ...    {"$avg":/$min/$max/$count: "src"} } }
+{ "$sort":   { "field": 1 } }
+{ "$limit":  N }
+{ "$skip":   N }
+```
+
+---
+
+## 9 · Vectors (HNSW) — per-collection k-NN
+
+```
+POST   /api/v1/collections/{c}/vectors           {"_id":"...", "vector":[...], "metadata":{...}}
+DELETE /api/v1/collections/{c}/vectors/{id}
+POST   /api/v1/collections/{c}/vectors/search    {"vector":[...], "k":10, "filter":{...}}
+                                                 → data: [{_id, score, metadata}, ...]
+```
+
+There is no separate index-create step. The first upsert builds the
+HNSW graph automatically. Vectors live alongside documents but use
+their own storage; a collection may use only documents, only vectors,
+or both.
+
+---
+
+## 10 · Cache (Redis-style; persisted)
+
+The cache survives restart when the server runs with `--data DIR`
+(default install: `~/.deltaql`).
+
+### KV
+
+```
+POST   /api/v1/cache                  {"key":"k","value":"v","ttl":60}     ttl optional, seconds
+GET    /api/v1/cache/{key}                                                  → data: {key, value, ttl}
+DELETE /api/v1/cache/{key}
+POST   /api/v1/cache/{key}/expire     {"ttl":300}
+POST   /api/v1/cache/{key}/incr       {"delta":1}                           → data: {value: <int>}
+```
+
+### Hash
+
+```
+POST   /api/v1/cache/{key}/hash       {"field":"name","value":"alice"}
+GET    /api/v1/cache/{key}/hash                                            all fields
+GET    /api/v1/cache/{key}/hash/{f}
+DELETE /api/v1/cache/{key}/hash/{f}
+```
+
+### List (push **one** value per call; choose direction)
+
+```
+POST   /api/v1/cache/{key}/list/push  {"value":"x","direction":"left"|"right"}   → data: {length}
+GET    /api/v1/cache/{key}/list?start=0&stop=-1                                  → data: {items:[...]}
+```
+
+### Set
+
+```
+POST   /api/v1/cache/{key}/set        {"member":"alice"}                   → data: {added:0|1}
+GET    /api/v1/cache/{key}/set                                             → data: {members:[...]}
+DELETE /api/v1/cache/{key}/set/{member}
+```
+
+### Sorted set
+
+```
+POST   /api/v1/cache/{key}/zset       {"member":"alice","score":42.0}
+GET    /api/v1/cache/{key}/zset?start=0&stop=-1                            → data: {items:[{member,score}]}
+```
+
+---
+
+## 11 · Pub/Sub
+
+Anyone with permission can publish:
+
+```
+POST /api/v1/pubsub/publish    {"channel":"trades","message":"<string>"}
+                                → data: {subscribers: N}
+```
+
+To **receive** pushes you need a persistent transport. **Don't poll.**
+
+* On `deltaql://`: send a `SUB` frame with `{"channel":"..."}`. The
+  server delivers `PUBLISH` frames (type=0x0C, rid=0) on the same
+  socket whenever anyone publishes. Use the Python client in §2.2:
+  `db.subscribe("trades", lambda ch, msg: ...)`.
+* On `ws://`: send `{"type":"subscribe","channel":"..."}`. Inbound
+  `{"type":"publish","channel":"...","message":"..."}` frames arrive
+  on the same WebSocket. Use the JS client in §3:
+  `await db.subscribe("trades", (ch, msg) => ...)`.
+* On `http://`: not possible. Switch transports.
+
+You can **publish** over any transport, including HTTP. Subscribing
+requires persistent.
+
+---
+
+## 12 · Users · Roles · Permissions (RBAC)
+
+Privileges are case-insensitive strings:
+`SELECT INSERT UPDATE DELETE CREATE DROP ALTER INDEX TRUNCATE REFERENCES TRIGGER EXECUTE USAGE CONNECT`.
+
+Built-in roles: `superuser, db_admin, user_admin, read_write, read_only, public`.
+
+```
+GET    /api/v1/users
+POST   /api/v1/users                {"username":"alice","password":"s3cret",
+                                     "default_database":"shop","default_schema":"public"}
+GET    /api/v1/users/{u}
+PATCH  /api/v1/users/{u}            {"password":"new"}
+DELETE /api/v1/users/{u}
+POST   /api/v1/users/{u}/lock
+POST   /api/v1/users/{u}/unlock
+POST   /api/v1/users/{u}/roles      {"role":"read_write"}
+DELETE /api/v1/users/{u}/roles/{role}
+
+GET    /api/v1/roles
+POST   /api/v1/roles                {"name":"auditor","description":"..."}
+DELETE /api/v1/roles/{name}
+
+GET    /api/v1/permissions
+POST   /api/v1/permissions/grant      {"role":"auditor","privileges":["SELECT"],
+                                       "target":{"type":"collection","database":"shop",
+                                                 "schema":"public","collection":"orders"}}
+POST   /api/v1/permissions/grant-all  {"role":"auditor",
+                                       "target":{"type":"database","database":"shop"}}
+POST   /api/v1/permissions/revoke     {role, privileges, target}
+```
+
+### Row-level security (RLS)
+
+```
+POST /api/v1/databases/{db}/schemas/{s}/collections/{c}/rls
+     {"rules":[{"role":"auditor","predicate":{"tenant_id":42}}]}
+GET  /api/v1/databases/{db}/schemas/{s}/collections/{c}/policies
+POST /api/v1/databases/{db}/schemas/{s}/collections/{c}/policies
+DELETE /api/v1/databases/{db}/schemas/{s}/collections/{c}/policies/{p}
+```
+
+---
+
+## 13 · Errors
+
+| `code` | HTTP | Meaning                                         |
+| ------ | ---- | ----------------------------------------------- |
+| 0      | 200  | OK                                              |
+| 1      | 500  | Generic error                                   |
+| 2      | 404  | NotFound — collection / doc / user / role       |
+| 3      | 409  | Duplicate — `_id` exists, role exists, ...      |
+| 4      | 400  | Invalid — bad field, validation, ...            |
+| 5      | 401  | Unauthorized — missing/expired token            |
+| 6      | 403  | Forbidden — RBAC denied / read-only replica     |
+| 7      | 500  | Internal                                        |
+
+Replicas reject mutations with HTTP 403 + body
+`{"role":"replica","master_url":"http://master:16888"}` — retry against
+the master URL.
+
+Over `deltaql://`, the server sends a frame of type `ERROR (0x07)` with
+`{"code": -1, "message": "..."}` for protocol-level failures. For
+endpoint-level errors (NotFound, Forbidden, etc.) it sends a normal
+`RESPONSE` frame whose `body.code` carries the Status enum — handle it
+the same way you would an HTTP error response.
+
+---
+
+## 14 · Replication / cluster
+
+```
+GET  /api/v1/cluster/info                role, lsn, master_url, replicas[]
+GET  /api/v1/cluster/changes?since=N     WAL changes since LSN
+GET  /api/v1/cluster/snapshot            full bootstrap snapshot
+POST /api/v1/cluster/promote             this replica → master
+POST /api/v1/cluster/demote              {"master_url":"http://..."}
+```
+
+Boot a replica:
+
+```bash
+delta_server --role replica --master-url http://master:16888 --cluster-token <secret> ...
+```
+
+---
+
+## 15 · Complete REST endpoint index
+
+```
+auth/session
+  POST   /api/v1/auth/login                           { username, password } → { token, ... }
+  POST   /api/v1/auth/logout
+  GET    /api/v1/auth/me
+  POST   /api/v1/use                                  { database, schema }
+
+introspection
+  GET    /api/v1/health                               (no auth)
+  GET    /api/v1/stats
+  GET    /api/v1/status
+
+databases / schemas
+  GET    /api/v1/databases
+  POST   /api/v1/databases                            { name, ... }
+  GET    /api/v1/databases/{db}
+  PATCH  /api/v1/databases/{db}
+  DELETE /api/v1/databases/{db}
+  GET    /api/v1/databases/{db}/schemas
+  POST   /api/v1/databases/{db}/schemas
+  DELETE /api/v1/databases/{db}/schemas/{schema}
+  GET    /api/v1/databases/{db}/schemas/{s}/collections/{c}/policies
+  POST   /api/v1/databases/{db}/schemas/{s}/collections/{c}/policies
+  DELETE /api/v1/databases/{db}/schemas/{s}/collections/{c}/policies/{p}
+  POST   /api/v1/databases/{db}/schemas/{s}/collections/{c}/rls
+
+collections / documents
+  GET    /api/v1/collections                          ?database=
+  POST   /api/v1/collections                          { name, indexes?, database?, schema? }
+  GET    /api/v1/collections/{c}
+  PATCH  /api/v1/collections/{c}
+  DELETE /api/v1/collections/{c}
+  POST   /api/v1/collections/{c}/indexes              { name, fields, unique? }
+  DELETE /api/v1/collections/{c}/indexes/{name}
+  POST   /api/v1/collections/{c}/documents            { ...doc }
+  POST   /api/v1/collections/{c}/documents/bulk       { documents:[...] }
+  GET    /api/v1/collections/{c}/documents/{id}
+  PATCH  /api/v1/collections/{c}/documents/{id}       { $set/$inc/... }
+  DELETE /api/v1/collections/{c}/documents/{id}
+  POST   /api/v1/collections/{c}/documents/search     { filter, sort?, limit?, skip?, fields? }
+  POST   /api/v1/collections/{c}/count                { filter }
+  POST   /api/v1/collections/{c}/aggregate            { pipeline }
+
+vectors
+  POST   /api/v1/collections/{c}/vectors              { _id, vector, metadata? }
+  DELETE /api/v1/collections/{c}/vectors/{id}
+  POST   /api/v1/collections/{c}/vectors/search       { vector, k, filter? }
+
+cache
+  POST   /api/v1/cache                                { key, value, ttl? }
+  GET    /api/v1/cache/{key}
+  DELETE /api/v1/cache/{key}
+  POST   /api/v1/cache/{key}/expire                   { ttl }
+  POST   /api/v1/cache/{key}/incr                     { delta }
+  POST   /api/v1/cache/{key}/hash                     { field, value }
+  GET    /api/v1/cache/{key}/hash
+  GET    /api/v1/cache/{key}/hash/{field}
+  DELETE /api/v1/cache/{key}/hash/{field}
+  POST   /api/v1/cache/{key}/list/push                { value, direction:"left"|"right" }
+  GET    /api/v1/cache/{key}/list                     ?start=&stop=
+  POST   /api/v1/cache/{key}/set                      { member }
+  GET    /api/v1/cache/{key}/set
+  DELETE /api/v1/cache/{key}/set/{member}
+  POST   /api/v1/cache/{key}/zset                     { member, score }
+  GET    /api/v1/cache/{key}/zset                     ?start=&stop=
+
+pubsub
+  POST   /api/v1/pubsub/publish                       { channel, message }
+   (subscribe via deltaql:// SUB frame or ws:// {type:"subscribe"} — see §11)
+
+rbac
+  GET    /api/v1/users
+  POST   /api/v1/users                                { username, password, ... }
+  GET    /api/v1/users/{u}
+  PATCH  /api/v1/users/{u}
+  DELETE /api/v1/users/{u}
+  POST   /api/v1/users/{u}/lock
+  POST   /api/v1/users/{u}/unlock
+  POST   /api/v1/users/{u}/roles                      { role }
+  DELETE /api/v1/users/{u}/roles/{role}
+  GET    /api/v1/roles
+  POST   /api/v1/roles                                { name, description? }
+  DELETE /api/v1/roles/{r}
+  GET    /api/v1/permissions
+  POST   /api/v1/permissions/grant                    { role, privileges:[...], target }
+  POST   /api/v1/permissions/grant-all                { role, target }
+  POST   /api/v1/permissions/revoke                   { role, privileges:[...], target }
+
+cluster
+  GET    /api/v1/cluster/info
+  GET    /api/v1/cluster/changes                      ?since=
+  GET    /api/v1/cluster/snapshot
+  POST   /api/v1/cluster/promote
+  POST   /api/v1/cluster/demote                       { master_url }
+
+ops
+  GET    /api/v1/connections
+  DELETE /api/v1/connections/{id}
+  GET    /llms.txt                                    (this file; no auth)
+```
+
+Every mutating route honors `Authorization: Bearer <token>` over HTTP, or
+the sticky AUTH state of a `deltaql://` / `ws://` connection.
+
+---
+
+## 16 · Recipes
+
+### 16.1 Long-running agent: ONE persistent connection for everything
+
+```python
+from delta_persistent import Delta     # the class from §2.2
+
+db = Delta()                                              # opens once
+db.auth("admin", "admin")                                 # logs in once
+db.request("POST", "/api/v1/use", body={"database":"shop","schema":"public"})
+
+def insert_order(o):
+    db.request("POST", "/api/v1/collections/orders/documents", body=o)
+
+def search_orders(uid):
+    return db.request("POST",
+        "/api/v1/collections/orders/documents/search",
+        body={"filter":{"user_id":uid}, "limit":50})
+
+# Live event tap on the SAME socket — no second connection needed:
+db.subscribe("orders.events", lambda ch, msg: print("event:", msg))
+
+while True:                                                # business logic loop
+    insert_order(...)
+    print(search_orders(...))
+```
+
+The connection lives as long as the process. No connection pooling, no
+re-auth, no HTTP overhead.
+
+### 16.2 Cache-aside read-through
+
+```python
+def get_user(uid):
+    cached = db.request("GET", f"/api/v1/cache/user:{uid}").get("value")
+    if cached is not None:
+        return json.loads(cached)
+    raw = db.request("GET", f"/api/v1/collections/users/documents/{uid}")
+    user = raw["data"]                                  # flatten if you want
+    db.request("POST", "/api/v1/cache",
+               body={"key":f"user:{uid}","value":json.dumps(user),"ttl":300})
+    return user
+```
+
+### 16.3 Vector RAG ingest + query
+
+```python
+for chunk in chunks:
+    db.request("POST", "/api/v1/collections/docs/vectors",
+               body={"_id": chunk.id, "vector": chunk.embedding,
+                     "metadata":{"src": chunk.src}})
+
+hits = db.request("POST", "/api/v1/collections/docs/vectors/search",
+                  body={"vector": query_embedding, "k": 10,
+                        "filter": {"src": "manual"}})
+```
+
+### 16.4 Pubsub fan-out
+
+```python
+# Producer (any process, any transport — even one-shot HTTP curl)
+db.request("POST", "/api/v1/pubsub/publish",
+           body={"channel":"trades","message": json.dumps({"side":"buy","qty":42})})
+
+# Consumer (long-running, one persistent connection)
+db.subscribe("trades", lambda ch, msg: handle(json.loads(msg)))
+# ... never returns — the daemon thread reading the socket invokes the callback.
+```
+
+### 16.5 Bootstrap a tenant
+
+```python
+db.request("POST", "/api/v1/databases", body={"name":"shop"})
+db.request("POST", "/api/v1/databases/shop/schemas", body={"name":"public"})
+db.request("POST", "/api/v1/use", body={"database":"shop","schema":"public"})
+db.request("POST", "/api/v1/collections",
+    body={"name":"orders",
+          "indexes":[{"name":"by_user","fields":["user_id"]}]})
+db.request("POST", "/api/v1/collections/orders/documents/bulk",
+    body={"documents":[{"user_id":"u1","total":12.5},
+                       {"user_id":"u2","total":99}]})
+```
+
+---
+
+## 17 · Tips for LLM coding agents
+
+1. **Default to a persistent connection.** Open ONE `deltaql://` (Python,
+   backend) or `ws://` (browser, edge) connection at process start, AUTH
+   once, and reuse it for every subsequent operation. Treat it like a
+   MySQL connection handle.
+2. **Don't re-open per request.** That's anti-pattern. The server sets
+   TCP_NODELAY + KEEPALIVE; one socket can carry millions of requests.
+3. **Don't re-authenticate per request.** AUTH is sticky — the server
+   keeps your token attached to the connection. After AUTH, REQUEST
+   frames need no `Authorization` header.
+4. **Use `rid` to multiplex.** Many requests can be in flight at once.
+   Match RESPONSE frames back to your callers by the echoed `rid`.
+5. **Subscribe on the same socket** for live updates. No separate
+   connection. No polling. The server pushes PUBLISH frames whenever
+   anyone publishes.
+6. **HTTP is the fallback.** Use it for one-off `curl` commands and
+   migration scripts. Don't build a long-running app on top of
+   HTTP-per-request.
+7. **Always check `code` in the response body**, not just the HTTP
+   status — `code != 0/200` always means failure.
+8. **`_id` is optional** on insert. The server assigns a snowflake-ish
+   ID returned in `data.id`.
+9. **Filters use Mongo-ish `$` operators**, not SQL. (§8.1)
+10. **Updates require operators** (`$set`, `$inc`, ...). A bare object
+    does NOT replace the document. (§8.2)
+11. **List endpoints wrap items** under a key — `data.users`,
+    `data.documents`, `data.items`, `data.members`, etc.
+12. **Documents wrap user fields** under `data.data` on the wire. To
+    get a flat object, merge the top-level metadata with `data.data`
+    client-side. The §2.2 client returns the raw envelope so you can
+    do this in your own helper.
+13. **Field-name gotchas:** `incr` uses `delta` (not `by`); `list/push`
+    uses `value` (not `values`); `set` uses `member` (not `members`).
+14. **The cache survives restart** when the server has `--data DIR`.
+15. **Replicas reject mutations** with HTTP 403; the body's
+    `master_url` tells you where to retry.
+16. **Frame size cap is 64 MiB.** Use `documents/bulk` or chunk uploads
+    for huge writes.
+17. **Pagination is `limit + skip`.** No cursor API. Sort by `_id` or
+    `created_at` for stable ordering across pages.
+18. **CORS is open** (`Access-Control-Allow-Origin: *`), so browsers can
+    call HTTP and WebSocket directly.
+19. **`/llms.txt` is your friend.** Re-fetch it whenever you doubt an
+    endpoint shape.
+
+---
+
+## 18 · Where the source lives
+
+If anything below disagrees with the live server, the source wins —
+file a bug at <https://github.com/ProtectsAPP/delta>.
+
+* Persistent protocol server (this is the MySQL-equivalent):
+  `src/network/deltaql_server.hpp`, `src/network/deltaql_protocol.hpp`
+* WebSocket bridge (the same protocol over JSON for browsers):
+  `src/network/ws_server.hpp`
+* HTTP route table & request shapes:
+  `src/network/http_server.hpp`
+* Filter / update operators:
+  `src/core/document.hpp`
+* Aggregation pipeline:
+  `src/core/collection.hpp`
+* Auth & RBAC:
+  `src/auth/auth_manager.hpp`
+* End-to-end protocol smoke test (run all three transports):
+  `scripts/test_protocols.py`
+
+**Everything in this file is self-contained.** The §2.2 Python class
+and the §3 JavaScript class are *the* clients — copy them straight into
+your project. There is nothing to `pip install` and nothing to
+`npm install`. If you can open a TCP socket (or a WebSocket) and parse
+JSON, you can drive Delta in any language with the frame layout in §2.1.

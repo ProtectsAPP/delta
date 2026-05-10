@@ -1,0 +1,25 @@
+# build outputs
+build/
+data/
+dist/
+
+# node
+node_modules/
+*.log
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# delta runtime data
+*.sst
+wal.log
+lsn
+vectors/
+
+# stress / test artifacts
+/tmp/
+site/public/llms.txt
+ipv4_source.txt
