@@ -247,6 +247,20 @@ public:
         ensure_system();
     }
 
+    // Drop in-memory user/role/permission caches and re-hydrate from the
+    // store. Pairs with DatabaseManager::reload() during /admin/restore.
+    void reload() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            users_.clear();
+            roles_.clear();
+            permissions_.clear();
+            next_user_id_ = next_role_id_ = next_perm_id_ = 1;
+            load_all();
+        }
+        ensure_system();    // takes mu_ itself; must be outside the guard
+    }
+
     // ---- Users ----
     Status create_user(const std::string& name, const std::string& password, const json& opts = json::object()) {
         std::lock_guard<std::mutex> lk(mu_);

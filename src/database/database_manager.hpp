@@ -70,6 +70,22 @@ class DatabaseManager {
 public:
     explicit DatabaseManager(storage::LSMTree* store) : store_(store) { load(); ensure_default(); }
 
+    // Drop in-memory caches and rebuild them from the underlying store.
+    // Called by /api/v1/admin/restore after a bulk apply, so the operator
+    // doesn't have to bounce the process to see the restored databases.
+    void reload() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            databases_.clear();
+            schemas_.clear();
+            policies_.clear();
+            rls_enabled_.clear();
+            next_db_id_ = next_schema_id_ = next_policy_id_ = 1;
+            load();
+        }
+        ensure_default();   // takes mu_ itself; must be outside the guard
+    }
+
     Status create_database(const std::string& name, const std::string& owner, const json& opts = json::object()) {
         std::lock_guard<std::mutex> lk(mu_);
         if (databases_.count(name)) return Status::Duplicate("database exists");

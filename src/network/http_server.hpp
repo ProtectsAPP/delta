@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <httplib.h>
 #include <fstream>
+#include <sstream>
 
 namespace delta::network {
 
@@ -951,6 +952,96 @@ private:
         });
 
         srv_.Get("/api/v1/health", [this](const httplib::Request&, httplib::Response& res) { ok(res, json{{"ok", true}}); });
+
+        // ---------- ADMIN BACKUP / RESTORE -------------------------------
+        // Superuser-only, orthogonal to the cluster snapshot endpoint
+        // (which is gated by the cluster token, not by user identity).
+        // Streams the full keyspace as a JSON dump suitable for cold-start
+        // migrations between deployments / regions.
+        srv_.Get("/api/v1/admin/backup", [this](const httplib::Request& req, httplib::Response& res) {
+            auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!auth_->is_superuser(s.username)) { err(res, Status::FORBIDDEN, "superuser only"); return; }
+            uint64_t lsn = store_->current_lsn();
+            json recs = json::array();
+            for (auto& [k, v] : store_->prefix_scan("", 100000000)) {
+                recs.push_back({{"key", k}, {"value", v}});
+            }
+            ok(res, json{{"lsn", lsn},
+                         {"records", recs},
+                         {"count", recs.size()},
+                         {"timestamp_ms", now_ms()},
+                         {"version", "1.0.0"}});
+        });
+
+        srv_.Post("/api/v1/admin/restore", [this](const httplib::Request& req, httplib::Response& res) {
+            auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!auth_->is_superuser(s.username)) { err(res, Status::FORBIDDEN, "superuser only"); return; }
+            json b = parse_body(req);
+            if (!b.contains("records") || !b["records"].is_array()) {
+                err(res, Status::INVALID, "missing `records` array");
+                return;
+            }
+            size_t applied = 0, skipped = 0;
+            uint64_t base_lsn = b.value("lsn", store_->current_lsn());
+            for (auto& r : b["records"]) {
+                if (!r.contains("key") || !r.contains("value")) { ++skipped; continue; }
+                store_->apply_replicated(base_lsn,
+                                         r["key"].get<std::string>(),
+                                         r["value"].get<std::string>(),
+                                         r.value("tombstone", false));
+                ++applied;
+            }
+            // Re-hydrate the in-memory metadata caches. Documents and cache
+            // entries are looked up directly from `store_` per request so
+            // they don't need a reload — only the DBM and Auth caches do.
+            dbm_->reload();
+            auth_->reload();
+            ok(res, json{{"applied", applied}, {"skipped", skipped}, {"lsn", base_lsn}});
+        });
+
+        // ---------- /metrics (Prometheus text format) -----------------
+        // Unauthenticated by convention — scrapers run inside the trust
+        // boundary. Use a reverse proxy / network policy to restrict
+        // access if you expose the server to the public internet.
+        srv_.Get("/metrics", [this](const httplib::Request& /*req*/, httplib::Response& res) {
+            auto cs = cache_->stats();
+            uint64_t up   = std::max<uint64_t>(1, (now_ms() - start_time_) / 1000);
+            uint64_t reqs = req_count_.load(std::memory_order_relaxed);
+            size_t total_docs = 0;
+            for (auto& d : dbm_->list_databases())
+                for (auto& c : col_->list_collections(d.name))
+                    total_docs += c.document_count;
+            size_t vec_count = 0, vec_indexes = 0;
+            for (auto& key : vec_->list()) {
+                auto idx = vec_->get(key);
+                if (idx) { vec_count += idx->size(); ++vec_indexes; }
+            }
+            std::ostringstream m;
+            auto line = [&](const char* name, const char* help, const char* type,
+                            double value) {
+                m << "# HELP " << name << " " << help << "\n"
+                  << "# TYPE " << name << " " << type << "\n"
+                  << name << " " << value << "\n";
+            };
+            line("delta_uptime_seconds",       "Server uptime in seconds.",                "counter", (double)up);
+            line("delta_http_requests_total",  "Total HTTP requests served.",              "counter", (double)reqs);
+            line("delta_documents_total",      "Total documents across all collections.",  "gauge",   (double)total_docs);
+            line("delta_databases_total",      "Number of databases.",                     "gauge",   (double)dbm_->list_databases().size());
+            line("delta_users_total",          "Number of users.",                         "gauge",   (double)auth_->list_users().size());
+            line("delta_roles_total",          "Number of roles.",                         "gauge",   (double)auth_->list_roles().size());
+            line("delta_cache_keys",           "Total live cache keys.",                   "gauge",   (double)cs.total_keys);
+            line("delta_cache_memory_bytes",   "Cache memory footprint in bytes (P2-2).",  "gauge",   (double)cs.mem_bytes);
+            line("delta_cache_hits_total",     "Cache lookups that hit.",                  "counter", (double)cs.hits);
+            line("delta_cache_misses_total",   "Cache lookups that missed.",               "counter", (double)cs.misses);
+            line("delta_cache_hit_rate",       "Cache hit ratio in [0,1].",                "gauge",   cs.hit_rate);
+            line("delta_vector_indexes",       "Number of HNSW indexes.",                  "gauge",   (double)vec_indexes);
+            line("delta_vector_vectors_total", "Total vectors across all indexes.",        "gauge",   (double)vec_count);
+            line("delta_storage_sstables",    "Live SSTable file count.",                  "gauge",   (double)store_->sstable_count());
+            line("delta_connections_total",    "Total registered client connections.",     "gauge",   (double)pool_->total());
+            line("delta_connections_active",   "Currently active connections.",            "gauge",   (double)pool_->active());
+            line("delta_http_threads",         "HTTP worker thread count.",                "gauge",   (double)thread_count_);
+            res.set_content(m.str(), "text/plain; version=0.0.4; charset=utf-8");
+        });
     }
 
     // ------------------------------------------------------------------
