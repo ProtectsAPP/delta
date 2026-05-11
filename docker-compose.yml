@@ -1,0 +1,34 @@
+# =============================================================================
+# Delta · docker-compose for single-node deployment.
+#
+# Bring up:   docker compose up -d
+# Logs:       docker compose logs -f delta
+# Stop:       docker compose down
+#
+# Data lives in the named volume `delta-data` (== /data inside the container,
+# which the server treats as $HOME so it resolves to ~/.deltaql).
+# =============================================================================
+services:
+  delta:
+    build: .
+    image: delta:latest
+    container_name: delta
+    restart: unless-stopped
+    ports:
+      - "16888:16888"   # HTTP REST
+      - "16889:16889"   # deltaql binary protocol
+      - "16890:16890"   # WebSocket
+    volumes:
+      - delta-data:/data
+    environment:
+      # Default admin credentials for first boot. Change before exposing.
+      - DELTA_ADMIN_USER=admin
+      - DELTA_ADMIN_PASS=change-me-in-production
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "16888"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  delta-data:

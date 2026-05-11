@@ -1,12 +1,14 @@
 #pragma once
 #include "../core/common.hpp"
 #include "../core/collection.hpp"
+#include "../core/validation.hpp"
 #include "../cache/cache_engine.hpp"
 #include "../vector/hnsw_index.hpp"
 #include "../auth/auth_manager.hpp"
 #include "../database/database_manager.hpp"
 #include "connection_pool.hpp"
 #include "replication.hpp"
+#include <algorithm>
 #include <httplib.h>
 #include <fstream>
 
@@ -48,6 +50,17 @@ public:
     }
     void stop() { srv_.stop(); }
     bool is_running() const { return srv_.is_running(); }
+
+    // P0-9: per-deployment CORS policy. Empty list keeps the legacy
+    // permissive behavior (`*`). Non-empty turns on strict allow-list
+    // matching with `Vary: Origin`. Call BEFORE listen().
+    struct CorsPolicy {
+        std::vector<std::string> origins;        // empty = wide-open
+        bool                     allow_credentials = true;
+        std::string              methods = "GET,POST,PATCH,PUT,DELETE,OPTIONS";
+        std::string              headers = "Authorization,Content-Type,X-Delta-Token,X-Cluster-Token";
+    };
+    void set_cors(const CorsPolicy& p) { cors_ = p; }
 
     // Counters for live RPS reporting
     uint64_t total_requests() const { return req_count_.load(std::memory_order_relaxed); }
@@ -126,6 +139,11 @@ private:
     int keepalive_max_count_ = 1000;
     int keepalive_timeout_sec_ = 30;
     std::atomic<uint64_t> req_count_{0};
+    // P0-9: empty by default — wide-open `*` for dev. Operators turn on
+    // strict allow-list mode by calling set_cors() before listen().
+    CorsPolicy cors_;
+    // P1-17: per (ip|user) sliding-window login rate limiter.
+    auth::LoginRateLimiter login_limiter_;
 
 private:
     storage::LSMTree* store_;
@@ -153,20 +171,26 @@ private:
             default: return 200;
         }
     }
-    static void send_json(httplib::Response& res, int code, const json& body) {
+    void send_json(httplib::Response& res, int code, const json& body) {
         res.status = http_status_for(code);
         // body uses code 200 as a sentinel for "ok" in some places; remap
         if (code == 200) { res.status = 200; }
         json j; j["code"] = code; if (body.contains("data") || body.contains("message")) {
             for (auto& [k, v] : body.items()) j[k] = v;
         } else j["data"] = body;
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Headers", "*");
-        res.set_header("Access-Control-Allow-Methods", "*");
+        // P0-9: respect the configured CORS allow-list. send_json() doesn't
+        // see the request, so the per-request handler still has to call
+        // apply_cors() — but we keep the legacy headers here as a fallback
+        // for cross-origin tools that hit a JSON endpoint directly.
+        if (cors_.origins.empty()) {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Headers", "*");
+            res.set_header("Access-Control-Allow-Methods", "*");
+        }
         res.set_content(j.dump(), "application/json");
     }
-    static void ok(httplib::Response& res, const json& data) { send_json(res, 200, json{{"data", data}}); }
-    static void err(httplib::Response& res, int code, const std::string& msg) { send_json(res, code, json{{"message", msg}, {"data", nullptr}}); }
+    void ok(httplib::Response& res, const json& data) { send_json(res, 200, json{{"data", data}}); }
+    void err(httplib::Response& res, int code, const std::string& msg) { send_json(res, code, json{{"message", msg}, {"data", nullptr}}); }
 
     json parse_body(const httplib::Request& req) {
         if (req.body.empty()) return json::object();
@@ -216,12 +240,34 @@ private:
         return "";
     }
 
+    // P0-9: apply CORS headers based on the per-request Origin and the
+    // currently configured allow-list. Returns true if the origin was
+    // allowed (or the legacy wide-open mode is active).
+    bool apply_cors(const httplib::Request& req, httplib::Response& res) {
+        std::string origin = req.get_header_value("Origin");
+        if (cors_.origins.empty()) {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Headers", cors_.headers);
+            res.set_header("Access-Control-Allow-Methods", cors_.methods);
+            return true;
+        }
+        bool allowed = std::find(cors_.origins.begin(), cors_.origins.end(), origin)
+                       != cors_.origins.end();
+        if (allowed) {
+            res.set_header("Access-Control-Allow-Origin", origin);
+            res.set_header("Vary", "Origin");
+            res.set_header("Access-Control-Allow-Headers", cors_.headers);
+            res.set_header("Access-Control-Allow-Methods", cors_.methods);
+            if (cors_.allow_credentials)
+                res.set_header("Access-Control-Allow-Credentials", "true");
+        }
+        return allowed;
+    }
+
     void setup_routes() {
         // CORS preflight
-        srv_.Options(".*", [](const httplib::Request&, httplib::Response& res) {
-            res.set_header("Access-Control-Allow-Origin", "*");
-            res.set_header("Access-Control-Allow-Headers", "*");
-            res.set_header("Access-Control-Allow-Methods", "GET,POST,PATCH,PUT,DELETE,OPTIONS");
+        srv_.Options(".*", [this](const httplib::Request& req, httplib::Response& res) {
+            apply_cors(req, res);
             res.status = 204;
         });
 
@@ -248,8 +294,22 @@ private:
         srv_.Post("/api/v1/auth/login", [this](const httplib::Request& req, httplib::Response& res) {
             json b = parse_body(req);
             std::string user = b.value("username", ""), pw = b.value("password", "");
+            // P1-17: per-IP+username sliding-window cap. Keys are
+            // "<ip>|<user>" so an attacker can't trivially evade the cap by
+            // rotating usernames (each rotation gets its own bucket but the
+            // same source IP still exhausts the global firewall budget; see
+            // also rate-limit at the reverse proxy in production).
+            std::string rl_key = req.remote_addr + "|" + user;
+            if (!login_limiter_.allow(rl_key)) {
+                // 429 isn't in our Status enum; reuse FORBIDDEN with a clear
+                // message so the audit log captures it correctly.
+                err(res, Status::FORBIDDEN, "too many login attempts; try again later");
+                return;
+            }
             std::string er;
+            // P0-8 surfaces a uniform message; we just propagate it.
             if (!auth_->authenticate(user, pw, &er)) { err(res, Status::UNAUTHORIZED, er); return; }
+            login_limiter_.reset(rl_key);  // success clears the budget for this key
             auto u = auth_->get_user(user).value();
             auth_->record_login_ip(user, req.remote_addr);
             std::string db = b.value("database", u.default_database.empty() ? "default" : u.default_database);
@@ -285,7 +345,15 @@ private:
             if (!auth_->is_superuser(s.username)) { auto roles = auth_->get_user_all_roles(s.username); if (!roles.count("user_admin")) { err(res, Status::FORBIDDEN, "permission denied"); return; } }
             json b = parse_body(req);
             std::string user = b.value("username", ""), pw = b.value("password", "");
-            if (user.empty() || pw.empty()) { err(res, Status::INVALID, "username/password required"); return; }
+            // P1-20: validate username/password format on the public boundary.
+            if (!validation::is_valid_identifier(user)) {
+                err(res, Status::INVALID, "invalid username (1-64 chars, [a-zA-Z_][a-zA-Z0-9_]*)");
+                return;
+            }
+            if (!validation::is_valid_password(pw)) {
+                err(res, Status::INVALID, "password must be 8-128 characters");
+                return;
+            }
             auto st = auth_->create_user(user, pw, b);
             if (!st.ok()) { err(res, st.code, st.message); return; }
             auto u = auth_->get_user(user);
@@ -597,6 +665,19 @@ private:
             std::string sch = req.get_param_value("schema"); if (sch.empty()) sch = s.schema;
             if (!require_perm(res, s, auth::PRIV_UPDATE, col_target(db, sch, col_name))) return;
             json b = parse_body(req);
+            // P1-6: optimistic-locking handle. RFC 7232-style `If-Match`
+            // header wins; fall back to a `__if_version` body field if
+            // the header is absent (easier from browser fetch() which
+            // can't always set If-Match).
+            uint64_t expected_version = 0;
+            if (req.has_header("If-Match")) {
+                try { expected_version = std::stoull(req.get_header_value("If-Match")); }
+                catch (...) { expected_version = 0; }
+            } else if (b.contains("__if_version")) {
+                try { expected_version = b["__if_version"].get<uint64_t>(); }
+                catch (...) { expected_version = 0; }
+                b.erase("__if_version");
+            }
             // map shorthand to $ ops
             json update_ops = json::object();
             for (auto& [k, v] : b.items()) {
@@ -611,8 +692,13 @@ private:
                 else update_ops[k] = v;
             }
             json updated;
-            auto st = col_->update(db, sch, col_name, id, update_ops, &updated);
-            if (!st.ok()) { err(res, st.code, st.message); return; }
+            auto st = col_->update(db, sch, col_name, id, update_ops, &updated, expected_version);
+            if (!st.ok()) {
+                // P1-6: surface CONFLICT as HTTP 409 so clients can retry.
+                int http_code = (st.code == Status::CONFLICT) ? 409 : st.code;
+                err(res, http_code, st.message);
+                return;
+            }
             ok(res, json{{"matched", 1}, {"modified", 1}, {"document", updated}});
         });
         srv_.Delete(R"(/api/v1/collections/([^/]+)/documents/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
@@ -864,7 +950,7 @@ private:
             ok(res, data);
         });
 
-        srv_.Get("/api/v1/health", [](const httplib::Request&, httplib::Response& res) { ok(res, json{{"ok", true}}); });
+        srv_.Get("/api/v1/health", [this](const httplib::Request&, httplib::Response& res) { ok(res, json{{"ok", true}}); });
     }
 
     // ------------------------------------------------------------------

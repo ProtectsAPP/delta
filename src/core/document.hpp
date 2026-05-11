@@ -2,8 +2,43 @@
 #include "common.hpp"
 #include "../storage/lsm_tree.hpp"
 #include <regex>
+#include <shared_mutex>
 
 namespace delta {
+
+// P1-7: a process-wide cache of compiled std::regex objects keyed by
+// pattern string. Compilation is *expensive* (orders of magnitude more
+// than evaluation), so without this cache a `{$regex: ".*foo.*"}` query
+// over 10³ documents pays 10³ compilations. The cache uses a shared_mutex
+// so concurrent matchers can read in parallel and only contend on first
+// insertion of a new pattern. We don't evict — the working set of distinct
+// patterns in a workload is small and bounded by query templates.
+class RegexCache {
+public:
+    static const std::regex* get(const std::string& pat) {
+        auto& self = instance();
+        {
+            std::shared_lock<std::shared_mutex> rl(self.mu_);
+            auto it = self.cache_.find(pat);
+            if (it != self.cache_.end()) return &it->second;
+        }
+        std::unique_lock<std::shared_mutex> wl(self.mu_);
+        // Double-check after acquiring the write lock.
+        auto it = self.cache_.find(pat);
+        if (it != self.cache_.end()) return &it->second;
+        try {
+            auto [ins, ok] = self.cache_.emplace(pat,
+                std::regex(pat, std::regex::ECMAScript | std::regex::optimize));
+            return &ins->second;
+        } catch (const std::regex_error&) {
+            return nullptr;        // bad pattern — caller treats as "no match".
+        }
+    }
+private:
+    static RegexCache& instance() { static RegexCache c; return c; }
+    std::shared_mutex                          mu_;
+    std::unordered_map<std::string, std::regex> cache_;
+};
 
 struct IndexDef {
     std::string name;
@@ -105,8 +140,10 @@ private:
             else if (op == "$exists") { bool e = !field.is_null(); if (e != v.get<bool>()) return false; }
             else if (op == "$regex") {
                 if (!field.is_string()) return false;
-                try { std::regex re(v.get<std::string>()); if (!std::regex_search(field.get<std::string>(), re)) return false; }
-                catch(...) { return false; }
+                // P1-7: cached compile.
+                auto* re = RegexCache::get(v.get<std::string>());
+                if (!re) return false;
+                if (!std::regex_search(field.get<std::string>(), *re)) return false;
             }
             else if (op == "$contains") {
                 if (field.is_array()) { bool f=false; for(auto&x:field) if(x==v){f=true;break;} if(!f) return false; }

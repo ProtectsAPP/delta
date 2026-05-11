@@ -47,6 +47,28 @@ DELTA_DATA=~/data DELTA_PORT=18000 \
 DELTA_NO_SERVICE=1 curl -fsSL .../install.sh | bash
 ```
 
+## Docker
+
+A multi-stage `Dockerfile` and `docker-compose.yml` are included. The image
+builds `delta_server` in Release with the full unit-test suite (15/15) gated
+as part of the build, then ships a minimal runtime layer (libstdc++ + tini +
+non-root user, no shell tooling).
+
+```bash
+# build + run, with data persisted in a named volume
+docker compose up -d
+
+# or, manually:
+docker build -t delta:latest .
+docker run -d --name delta \
+    -p 16888:16888 -p 16889:16889 -p 16890:16890 \
+    -v $HOME/.deltaql:/data \
+    delta:latest
+```
+
+Ports: **16888** HTTP REST · **16889** `deltaql` binary · **16890** WebSocket.
+Data: `/data` inside the container (== `~/.deltaql` for the in-container user).
+
 ## Architecture
 
 ```

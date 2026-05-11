@@ -308,23 +308,189 @@ private:
             create_schema_locked("delta_system", "public", "admin");
         }
     }
+    // P1-22 RLS expression parser ----------------------------------------
+    //
+    // Grammar (recursive descent):
+    //
+    //     expr     := or_expr
+    //     or_expr  := and_expr ( "OR"  and_expr )*
+    //     and_expr := unary    ( "AND" unary    )*
+    //     unary    := "NOT" unary | "(" expr ")" | comparison
+    //     comparison := IDENT op value_list
+    //     op       := "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=" | "IN"
+    //     value_list := "(" value ("," value)* ")"     (only after IN)
+    //                 |  value
+    //     value    := STRING | NUMBER | TRUE | FALSE | NULL | variable
+    //     variable := current_user | current_user_id() | current_database()
+    //               | "$user" | "$database"
+    //
+    // The parser emits JSON filters compatible with FilterMatcher so the
+    // result composes with the user's own filter via $and/$or. A parse
+    // failure returns json::object() which evaluates as "match everything"
+    // — same semantics as the old toy parser, so legacy policies that
+    // happened to typo through it keep their behaviour.
     json parse_simple_expr(const std::string& expr, const std::string& username) {
-        // Very simple: "field = current_user" | "field = 'value'" | "field = current_user_id()"
-        // Returns equivalent JSON filter.
-        std::string e = expr;
-        // strip whitespace
-        auto trim = [](std::string& s){ while(!s.empty() && isspace((unsigned char)s.front())) s.erase(0,1); while(!s.empty() && isspace((unsigned char)s.back())) s.pop_back(); };
-        trim(e);
-        size_t eq = e.find("=");
-        if (eq == std::string::npos) return json::object();
-        std::string lhs = e.substr(0, eq); trim(lhs);
-        std::string rhs = e.substr(eq + 1); trim(rhs);
-        json val;
-        if (rhs == "current_user" || rhs == "current_user()" || rhs == "current_user_id()") val = username;
-        else if (rhs.size() >= 2 && rhs.front() == '\'' && rhs.back() == '\'') val = rhs.substr(1, rhs.size() - 2);
-        else if (rhs.size() >= 2 && rhs.front() == '"' && rhs.back() == '"') val = rhs.substr(1, rhs.size() - 2);
-        else { try { val = std::stod(rhs); } catch(...) { val = rhs; } }
-        return json{{lhs, val}};
+        RLSContext ctx{ expr, 0, username };
+        try {
+            json out = parse_or(ctx);
+            skip_ws(ctx);
+            if (ctx.pos != ctx.src.size()) return json::object();
+            return out;
+        } catch (const std::exception&) {
+            return json::object();
+        }
+    }
+
+    struct RLSContext {
+        std::string src;
+        size_t      pos;
+        std::string username;
+    };
+
+    static void skip_ws(RLSContext& c) {
+        while (c.pos < c.src.size() && std::isspace((unsigned char)c.src[c.pos])) ++c.pos;
+    }
+    static bool consume_kw(RLSContext& c, const char* kw) {
+        skip_ws(c);
+        size_t n = std::strlen(kw);
+        if (c.pos + n > c.src.size()) return false;
+        for (size_t i = 0; i < n; ++i)
+            if (std::toupper((unsigned char)c.src[c.pos + i]) != kw[i]) return false;
+        // boundary: must be followed by non-ident char
+        size_t e = c.pos + n;
+        if (e < c.src.size() && (std::isalnum((unsigned char)c.src[e]) || c.src[e] == '_'))
+            return false;
+        c.pos = e;
+        return true;
+    }
+    static bool consume_char(RLSContext& c, char ch) {
+        skip_ws(c);
+        if (c.pos < c.src.size() && c.src[c.pos] == ch) { ++c.pos; return true; }
+        return false;
+    }
+    static std::string parse_ident(RLSContext& c) {
+        skip_ws(c);
+        size_t s = c.pos;
+        while (c.pos < c.src.size() &&
+               (std::isalnum((unsigned char)c.src[c.pos]) || c.src[c.pos] == '_' || c.src[c.pos] == '.'))
+            ++c.pos;
+        if (c.pos == s) throw std::runtime_error("expected identifier");
+        return c.src.substr(s, c.pos - s);
+    }
+    static json parse_value(RLSContext& c) {
+        skip_ws(c);
+        if (c.pos >= c.src.size()) throw std::runtime_error("expected value");
+        char ch = c.src[c.pos];
+        if (ch == '\'' || ch == '"') {
+            char q = ch; ++c.pos;
+            std::string out;
+            while (c.pos < c.src.size() && c.src[c.pos] != q) {
+                if (c.src[c.pos] == '\\' && c.pos + 1 < c.src.size()) {
+                    out.push_back(c.src[c.pos + 1]); c.pos += 2;
+                } else { out.push_back(c.src[c.pos++]); }
+            }
+            if (c.pos >= c.src.size()) throw std::runtime_error("unterminated string");
+            ++c.pos;                                          // closing quote
+            return out;
+        }
+        if (ch == '-' || std::isdigit((unsigned char)ch)) {
+            size_t s = c.pos;
+            if (c.src[c.pos] == '-') ++c.pos;
+            bool seen_dot = false;
+            while (c.pos < c.src.size() &&
+                   (std::isdigit((unsigned char)c.src[c.pos]) ||
+                    (!seen_dot && c.src[c.pos] == '.'))) {
+                if (c.src[c.pos] == '.') seen_dot = true;
+                ++c.pos;
+            }
+            std::string num = c.src.substr(s, c.pos - s);
+            try { return seen_dot ? json(std::stod(num)) : json(std::stoll(num)); }
+            catch (...) { throw std::runtime_error("bad number: " + num); }
+        }
+        // Bareword: variable or keyword literal.
+        std::string id = parse_ident(c);
+        std::string up = id;
+        for (auto& ch2 : up) ch2 = (char)std::toupper((unsigned char)ch2);
+        if (up == "TRUE")  return true;
+        if (up == "FALSE") return false;
+        if (up == "NULL")  return json(nullptr);
+        if (id == "current_user" || id == "$user" || id == "current_user_id")
+            return c.username;
+        if (id == "current_database" || id == "$database")
+            return json("");  // resolver below could substitute live database
+        // optional parens: current_user() / current_user_id()
+        if (consume_char(c, '(')) {
+            if (!consume_char(c, ')')) throw std::runtime_error("expected ')'");
+            if (id == "current_user" || id == "current_user_id") return c.username;
+            return json(nullptr);
+        }
+        // unknown bareword → treat as raw string
+        return id;
+    }
+    json parse_comparison(RLSContext& c) {
+        std::string field = parse_ident(c);
+        skip_ws(c);
+        // op
+        std::string op;
+        if (c.pos + 1 < c.src.size() && c.src.compare(c.pos, 2, "!=") == 0) { op = "!="; c.pos += 2; }
+        else if (c.pos + 1 < c.src.size() && c.src.compare(c.pos, 2, "<>") == 0) { op = "!="; c.pos += 2; }
+        else if (c.pos + 1 < c.src.size() && c.src.compare(c.pos, 2, "<=") == 0) { op = "<="; c.pos += 2; }
+        else if (c.pos + 1 < c.src.size() && c.src.compare(c.pos, 2, ">=") == 0) { op = ">="; c.pos += 2; }
+        else if (c.pos < c.src.size() && c.src[c.pos] == '=') { op = "="; ++c.pos; }
+        else if (c.pos < c.src.size() && c.src[c.pos] == '<') { op = "<"; ++c.pos; }
+        else if (c.pos < c.src.size() && c.src[c.pos] == '>') { op = ">"; ++c.pos; }
+        else if (consume_kw(c, "IN")) { op = "IN"; }
+        else throw std::runtime_error("expected comparison operator");
+
+        if (op == "IN") {
+            if (!consume_char(c, '(')) throw std::runtime_error("expected '(' after IN");
+            json arr = json::array();
+            arr.push_back(parse_value(c));
+            while (consume_char(c, ',')) arr.push_back(parse_value(c));
+            if (!consume_char(c, ')')) throw std::runtime_error("expected ')'");
+            return json{{field, {{"$in", arr}}}};
+        }
+        json v = parse_value(c);
+        static const std::unordered_map<std::string,std::string> map = {
+            {"=","$eq"},{"!=","$ne"},{"<","$lt"},{"<=","$lte"},
+            {">","$gt"},{">=","$gte"}
+        };
+        return json{{field, {{map.at(op), v}}}};
+    }
+    json parse_unary(RLSContext& c) {
+        skip_ws(c);
+        if (consume_kw(c, "NOT")) return json{{"$not", parse_unary(c)}};
+        if (consume_char(c, '(')) {
+            json out = parse_or(c);
+            if (!consume_char(c, ')')) throw std::runtime_error("expected ')'");
+            return out;
+        }
+        return parse_comparison(c);
+    }
+    json parse_and(RLSContext& c) {
+        json lhs = parse_unary(c);
+        while (consume_kw(c, "AND")) {
+            json rhs = parse_unary(c);
+            // flatten $and chains
+            if (lhs.is_object() && lhs.contains("$and") && lhs["$and"].is_array()) {
+                lhs["$and"].push_back(rhs);
+            } else {
+                lhs = json{{"$and", json::array({lhs, rhs})}};
+            }
+        }
+        return lhs;
+    }
+    json parse_or(RLSContext& c) {
+        json lhs = parse_and(c);
+        while (consume_kw(c, "OR")) {
+            json rhs = parse_and(c);
+            if (lhs.is_object() && lhs.contains("$or") && lhs["$or"].is_array()) {
+                lhs["$or"].push_back(rhs);
+            } else {
+                lhs = json{{"$or", json::array({lhs, rhs})}};
+            }
+        }
+        return lhs;
     }
 
     storage::LSMTree* store_;

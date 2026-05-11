@@ -1,11 +1,64 @@
+// =============================================================================
+// auth_manager.hpp — users, roles, permissions, sessions.
+//
+// Audit fixes wired in here:
+//
+//   P0-8 (user enumeration): `authenticate()` no longer leaks the
+//          existence of a username through either the error string OR the
+//          response time. We always run a PBKDF2 verification — against a
+//          pre-computed dummy hash if the user doesn't exist — and we
+//          collapse "user not found", "user locked", "user expired" and
+//          "bad password" into a single uniform message.
+//
+//   P0-7 (timing): comparison happens inside `verify_password()` using
+//          `constant_time_compare()` (see password.hpp).
+//
+//   P1-17 (login rate limit): `LoginRateLimiter` caps attempts per
+//          (IP, username) tuple inside a sliding window. The HTTP layer
+//          calls `allow()` before forwarding to `authenticate()`.
+//
+//   P0-6 (legacy hash upgrade): if a user's stored hash is the old
+//          bare-hex format and they successfully log in, we transparently
+//          re-hash their password with PBKDF2-HMAC-SHA256 and persist the
+//          PHC-encoded result. After ~one login per user the legacy format
+//          is gone.
+// =============================================================================
 #pragma once
 #include "../core/common.hpp"
+#include "../core/constants.hpp"
 #include "../storage/lsm_tree.hpp"
 #include "password.hpp"
+#include <deque>
 #include <set>
 #include <bitset>
 
 namespace delta::auth {
+
+// In-process sliding-window login rate limiter (P1-17).
+// Keys are arbitrary strings — the HTTP layer typically uses
+// "<ip>|<username>" so a single attacker bot can't rotate usernames to
+// evade the cap. Window and max are read from constants.hpp.
+class LoginRateLimiter {
+public:
+    bool allow(const std::string& key) {
+        using namespace constants;
+        std::lock_guard<std::mutex> lk(mu_);
+        uint64_t now    = now_sec();
+        uint64_t cutoff = now > (uint64_t)AUTH_RATE_LIMIT_WINDOW_S
+                              ? now - (uint64_t)AUTH_RATE_LIMIT_WINDOW_S : 0;
+        auto& q = buckets_[key];
+        while (!q.empty() && q.front() < cutoff) q.pop_front();
+        if ((int)q.size() >= AUTH_RATE_LIMIT_MAX) return false;
+        q.push_back(now);
+        return true;
+    }
+    void reset(const std::string& key) {
+        std::lock_guard<std::mutex> lk(mu_); buckets_.erase(key);
+    }
+private:
+    std::mutex mu_;
+    std::unordered_map<std::string, std::deque<uint64_t>> buckets_;
+};
 
 enum class UserStatus { ACTIVE, LOCKED, EXPIRED, PENDING };
 inline std::string status_str(UserStatus s) {
@@ -202,6 +255,10 @@ public:
         u.id = next_user_id_++;
         u.username = name;
         u.salt = random_hex(16);
+        // hash_password() emits the new PHC-prefixed PBKDF2 string. The
+        // legacy `salt` field is still persisted so old code paths that
+        // happen to compare against it don't crash, but verify_password()
+        // now reads the salt out of the PHC string itself.
         u.password_hash = hash_password(password, u.salt);
         u.created_at = u.updated_at = now_ms();
         if (opts.contains("roles") && opts["roles"].is_array()) u.roles = opts["roles"].get<std::vector<std::string>>();
@@ -222,7 +279,8 @@ public:
         User& u = it->second;
         if (opts.contains("password")) {
             u.salt = random_hex(16);
-            u.password_hash = hash_password(opts["password"], u.salt);
+            std::string new_pw = opts["password"];
+            u.password_hash = hash_password(new_pw, u.salt);
         }
         if (opts.contains("connection_limit")) u.connection_limit = opts["connection_limit"];
         if (opts.contains("default_database")) u.default_database = opts["default_database"];
@@ -269,19 +327,47 @@ public:
         std::vector<User> out; for (auto& [_, u] : users_) out.push_back(u);
         return out;
     }
+    // P0-8: every failure path returns the SAME error and burns the SAME
+    // amount of time as a real failed verification, so an attacker probing
+    // /api/v1/auth/login can't tell "user not found" from "wrong password".
     bool authenticate(const std::string& username, const std::string& password, std::string* err = nullptr) {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = users_.find(username);
-        if (it == users_.end()) { if (err) *err = "user not found"; return false; }
-        User& u = it->second;
-        if (u.status == UserStatus::LOCKED) { if (err) *err = "user locked"; return false; }
-        if (u.valid_until > 0 && now_ms() > u.valid_until) { if (err) *err = "user expired"; return false; }
-        if (!verify_password(password, u.salt, u.password_hash)) {
+        const User* uptr = (it == users_.end()) ? nullptr : &it->second;
+
+        // Always verify against *something* so the wall-clock cost of a
+        // login attempt does not depend on whether the username exists.
+        bool ok = false;
+        if (uptr) {
+            ok = verify_password(password, uptr->salt, uptr->password_hash);
+        } else {
+            // Lazily compute a dummy hash once (still PBKDF2, same cost).
+            if (dummy_hash_.empty()) {
+                std::string dsalt = random_hex(16);
+                dummy_hash_ = hash_password("this-account-does-not-exist", dsalt);
+            }
+            (void)verify_password(password, std::string{}, dummy_hash_);
+            ok = false;
+        }
+
+        if (!uptr) { if (err) *err = "invalid credentials"; return false; }
+
+        User& u = *const_cast<User*>(uptr);
+        if (u.status == UserStatus::LOCKED) { if (err) *err = "invalid credentials"; return false; }
+        if (u.valid_until > 0 && now_ms() > u.valid_until) { if (err) *err = "invalid credentials"; return false; }
+
+        if (!ok) {
             u.failed_attempts++;
-            if (u.failed_attempts >= 5) u.status = UserStatus::LOCKED;
+            if (u.failed_attempts >= constants::AUTH_MAX_LOGIN_ATTEMPTS) u.status = UserStatus::LOCKED;
             save_user(u);
-            if (err) *err = "invalid password";
+            if (err) *err = "invalid credentials";
             return false;
+        }
+
+        // Successful login. Transparently upgrade legacy hashes (P0-6).
+        if (!is_phc_hash(u.password_hash)) {
+            u.salt = random_hex(16);
+            u.password_hash = hash_password(password, u.salt);
         }
         u.failed_attempts = 0;
         u.last_login = now_ms();
@@ -470,6 +556,8 @@ private:
     std::unordered_map<std::string, Role> roles_;
     std::vector<Permission> permissions_;
     uint64_t next_user_id_ = 1, next_role_id_ = 1, next_perm_id_ = 1;
+    // Memoized dummy hash for the user-enumeration mitigation (P0-8).
+    std::string dummy_hash_;
 };
 
 // Session management

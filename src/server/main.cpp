@@ -16,15 +16,14 @@
 #include <csignal>
 
 using namespace delta;
-static network::HttpServer* g_srv = nullptr;
-static network::DeltaQLServer* g_dql = nullptr;
-static network::ws::WebSocketServer* g_ws = nullptr;
-static void on_sig(int) {
-    if (g_dql) g_dql->stop();
-    if (g_ws)  g_ws->stop();
-    if (g_srv) g_srv->stop();
-    std::exit(0);
-}
+
+// P1-21: signal handlers must only do async-signal-safe work. Reading or
+// writing a std::atomic<int> with relaxed ordering is safe; calling
+// std::exit() (which runs destructors) is NOT — it can deadlock against
+// any mutex held by the interrupted thread. We just flip the flag and
+// rely on the main thread to drive an orderly shutdown.
+static std::atomic<int> g_shutdown_requested{0};
+static void on_sig(int) { g_shutdown_requested.store(1, std::memory_order_relaxed); }
 
 int main(int argc, char** argv) {
     auto cfg = server::ServerConfig::from_args(argc, argv);
@@ -76,7 +75,25 @@ int main(int argc, char** argv) {
                                     cfg.keepalive_timeout_sec, cfg.max_connections};
     network::HttpServer server(store.get(), col.get(), cache.get(), vec.get(),
                                 auth.get(), sessions.get(), dbm.get(), pool.get(), ht, repl.get());
-    g_srv = &server;
+
+    // P0-9: hand the CORS allow-list off to the HTTP layer. Empty list keeps
+    // the legacy permissive `*` behavior; a non-empty list enables strict
+    // origin matching with `Vary: Origin` and `Access-Control-Allow-Credentials`.
+    network::HttpServer::CorsPolicy cp;
+    cp.origins           = cfg.cors.allowed_origins;
+    cp.allow_credentials = cfg.cors.allow_credentials;
+    server.set_cors(cp);
+
+    // P1-24: refuse to silently expose cluster admin endpoints with no token.
+    // We don't *fail* startup so single-node dev still works, but we shout.
+    if (cfg.role != "standalone" && cfg.cluster_token.empty()) {
+        std::cerr
+            << "[Delta][WARN] role=" << cfg.role
+            << " but --cluster-token is empty. /cluster/* endpoints are unauthenticated.\n"
+            << "             Set --cluster-token=<long-random-string> for any non-dev deployment."
+            << std::endl;
+    }
+
     std::signal(SIGINT, on_sig);
     std::signal(SIGTERM, on_sig);
 
@@ -98,19 +115,27 @@ int main(int argc, char** argv) {
     if (cfg.deltaql_port > 0) {
         dql = std::make_unique<network::DeltaQLServer>(
             cfg.http_host, cfg.deltaql_port, lb.get(), cache.get());
-        g_dql = dql.get();
         try { dql->start(); }
-        catch (const std::exception& e) { std::cerr << "[Delta] deltaql disabled: " << e.what() << "\n"; dql.reset(); g_dql = nullptr; }
+        catch (const std::exception& e) { std::cerr << "[Delta] deltaql disabled: " << e.what() << "\n"; dql.reset(); }
     }
     if (cfg.ws_port > 0) {
         wss = std::make_unique<network::ws::WebSocketServer>(
             cfg.http_host, cfg.ws_port, lb.get(), cache.get());
-        g_ws = wss.get();
         try { wss->start(); }
-        catch (const std::exception& e) { std::cerr << "[Delta] websocket disabled: " << e.what() << "\n"; wss.reset(); g_ws = nullptr; }
+        catch (const std::exception& e) { std::cerr << "[Delta] websocket disabled: " << e.what() << "\n"; wss.reset(); }
     }
 
-    http_thread.join();
+    // P1-21: wait for the shutdown signal here instead of inside the signal
+    // handler. This lets every server's stop() / dtor run on the main
+    // thread under normal stack semantics.
+    while (!g_shutdown_requested.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    std::cerr << "[Delta] shutdown signal received, stopping..." << std::endl;
+    if (dql) dql->stop();
+    if (wss) wss->stop();
+    server.stop();
+    if (http_thread.joinable()) http_thread.join();
     running = false;
     return 0;
 }

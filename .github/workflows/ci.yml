@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # build + test the C++ core on Linux and macOS
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: build + ctest (${{ matrix.os }} · ${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            compiler: gcc
+            cc: gcc-12
+            cxx: g++-12
+          - os: ubuntu-22.04
+            compiler: clang
+            cc: clang-15
+            cxx: clang++-15
+          - os: macos-14
+            compiler: appleclang
+            cc: clang
+            cxx: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ${{ matrix.cc }}
+
+      - name: install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - name: configure
+        env:
+          CC:  ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: build
+        run: cmake --build build --parallel
+
+      - name: ctest
+        run: ctest --test-dir build --output-on-failure -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+  # ---------------------------------------------------------------------------
+  # build the Docker image so a broken Dockerfile is caught in CI, not in prod
+  # ---------------------------------------------------------------------------
+  docker-image:
+    name: docker build
+    runs-on: ubuntu-22.04
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: delta:ci
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max

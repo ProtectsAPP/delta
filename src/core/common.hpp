@@ -14,7 +14,7 @@ namespace delta {
 using json = nlohmann::json;
 
 struct Status {
-    enum Code { OK = 0, ERROR = 1, NOT_FOUND = 2, DUPLICATE = 3, INVALID = 4, UNAUTHORIZED = 5, FORBIDDEN = 6, INTERNAL = 7 };
+    enum Code { OK = 0, ERROR = 1, NOT_FOUND = 2, DUPLICATE = 3, INVALID = 4, UNAUTHORIZED = 5, FORBIDDEN = 6, INTERNAL = 7, CONFLICT = 8 };
     Code code = OK;
     std::string message;
     Status() = default;
@@ -26,6 +26,8 @@ struct Status {
     static Status Invalid(const std::string& m = "invalid") { return Status(INVALID, m); }
     static Status Unauth(const std::string& m = "unauthorized") { return Status(UNAUTHORIZED, m); }
     static Status Forbidden(const std::string& m = "forbidden") { return Status(FORBIDDEN, m); }
+    // P1-6: optimistic-locking version mismatch / lost-update.
+    static Status Conflict(const std::string& m = "conflict") { return Status(CONFLICT, m); }
     static Status Error(const std::string& m) { return Status(ERROR, m); }
 };
 
