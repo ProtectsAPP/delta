@@ -54,6 +54,14 @@ ServerConfig ServerConfig::from_args(int argc, char** argv) {
             // Repeatable flag: comma-separated or one origin per occurrence.
             for (auto& o : split_csv(next())) c.cors.allowed_origins.push_back(o);
         }
+        else if (a == "--log-level") c.log_level = next();
+        else if (a == "--log-file")  c.log_file  = next();
+        else if (a == "--slow-query-ms") c.slow_query_ms = std::atof(next().c_str());
+        else if (a == "--conn-rate")  c.conn_rate_per_sec = safe_stoi(next(), c.conn_rate_per_sec);
+        else if (a == "--conn-burst") c.conn_rate_burst   = safe_stoi(next(), c.conn_rate_burst);
+        else if (a == "--tls-cert")   c.tls_cert = next();
+        else if (a == "--tls-key")    c.tls_key  = next();
+        else if (a == "--backup-passphrase") c.backup_passphrase = next();
         else if (a == "--config") { c = from_file(next()); }
         else if (a == "--help" || a == "-h") {
             std::cout << "Delta Server\n"
@@ -76,6 +84,14 @@ ServerConfig ServerConfig::from_args(int argc, char** argv) {
                 "  --idle-timeout N        Idle connection timeout seconds (300)\n"
                 "  --cors-origin LIST      CORS allowlist (comma-sep or repeatable)\n"
                 "  --reset-admin           Unlock + clear failed_attempts on admin user\n"
+                "  --log-level LEVEL       debug|info|warn|error|off (default info)\n"
+                "  --log-file PATH         mirror stderr to file (optional)\n"
+                "  --slow-query-ms N       slow-query threshold ms (default 500)\n"
+                "  --conn-rate N           per-IP token-bucket fill rate (0=off)\n"
+                "  --conn-burst N          per-IP bucket capacity\n"
+                "  --tls-cert PATH         enable TLS with this PEM cert\n"
+                "  --tls-key  PATH         TLS private key (PEM)\n"
+                "  --backup-passphrase S   enable AES-256-GCM backup encryption\n"
                 "  --config FILE           Load JSON config\n";
             std::exit(0);
         }
@@ -115,6 +131,14 @@ ServerConfig ServerConfig::from_file(const std::string& path) {
     c.master_url            = j.value("master_url",             c.master_url);
     c.cluster_token         = j.value("cluster_token",          c.cluster_token);
     c.reset_admin           = j.value("reset_admin",            c.reset_admin);
+    c.log_level             = j.value("log_level",              c.log_level);
+    c.log_file              = j.value("log_file",               c.log_file);
+    c.slow_query_ms         = j.value("slow_query_ms",          c.slow_query_ms);
+    c.conn_rate_per_sec     = j.value("conn_rate_per_sec",      c.conn_rate_per_sec);
+    c.conn_rate_burst       = j.value("conn_rate_burst",        c.conn_rate_burst);
+    c.tls_cert              = j.value("tls_cert",               c.tls_cert);
+    c.tls_key               = j.value("tls_key",                c.tls_key);
+    c.backup_passphrase     = j.value("backup_passphrase",      c.backup_passphrase);
 
     if (j.contains("cors") && j["cors"].is_object()) {
         const auto& co = j["cors"];

@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""
+delta-admin — operator-facing CLI for a Delta cluster.
+
+A thin wrapper around the HTTP API so an operator never has to remember the
+exact endpoint paths. Uses only the Python standard library so it runs on a
+stock workstation, container or jumphost.
+
+  delta-admin login   --url http://host:16888 --user admin --password ...
+  delta-admin backup  [--out backup.json]
+  delta-admin restore --in backup.json
+  delta-admin metrics
+  delta-admin audit-tail   [--data-dir /var/lib/delta]   # local file tail
+  delta-admin slow-tail    [--data-dir /var/lib/delta]
+  delta-admin databases
+  delta-admin users
+
+The token from `login` is cached in ~/.delta-admin/token so subsequent calls
+just work. Override with --token or DELTA_TOKEN env var.
+"""
+
+from __future__ import annotations
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+CONF_DIR  = Path(os.path.expanduser("~/.delta-admin"))
+TOKEN_FILE = CONF_DIR / "token.json"
+
+
+def _save_session(url: str, token: str) -> None:
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(json.dumps({"url": url, "token": token}))
+    try:
+        os.chmod(TOKEN_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def _load_session() -> dict[str, str] | None:
+    if not TOKEN_FILE.exists():
+        return None
+    try:
+        return json.loads(TOKEN_FILE.read_text())
+    except Exception:
+        return None
+
+
+def _http(method: str, url: str, body: Any | None = None,
+          token: str | None = None, timeout: int = 60) -> tuple[int, Any]:
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data: bytes | None = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8")
+            try:
+                return r.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return r.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, raw
+
+
+def _resolved_session(args: argparse.Namespace) -> dict[str, str]:
+    if args.token and args.url:
+        return {"url": args.url, "token": args.token}
+    env = os.environ.get("DELTA_TOKEN")
+    if env and args.url:
+        return {"url": args.url, "token": env}
+    s = _load_session()
+    if not s:
+        sys.exit("error: not logged in; run `delta-admin login` first")
+    if args.url:
+        s["url"] = args.url
+    return s
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+def cmd_login(args: argparse.Namespace) -> int:
+    code, body = _http("POST", f"{args.url}/api/v1/auth/login",
+                       {"username": args.user, "password": args.password})
+    if code != 200 or not isinstance(body, dict) or body.get("code") != 200:
+        print(f"login failed: {code} {body}", file=sys.stderr)
+        return 1
+    token = body["data"]["token"]
+    _save_session(args.url, token)
+    print(f"logged in to {args.url} as {args.user}")
+    print(f"token cached in {TOKEN_FILE}")
+    return 0
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    s = _resolved_session(args)
+    code, body = _http("GET", f"{s['url']}/api/v1/admin/backup",
+                       token=s["token"], timeout=600)
+    if code != 200 or body.get("code") != 200:
+        print(f"backup failed: {code} {body}", file=sys.stderr)
+        return 1
+    payload = body["data"]
+    out = args.out or f"delta-backup-{int(time.time())}.json"
+    Path(out).write_text(json.dumps(payload))
+    encrypted = isinstance(payload, dict) and \
+                payload.get("format") == "delta-backup-1-encrypted"
+    print(f"wrote {out}  "
+          f"({'encrypted' if encrypted else 'plain'}, "
+          f"size={Path(out).stat().st_size} bytes)")
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    s = _resolved_session(args)
+    payload = json.loads(Path(args.in_).read_text())
+    code, body = _http("POST", f"{s['url']}/api/v1/admin/restore",
+                       body=payload, token=s["token"], timeout=600)
+    if code != 200 or body.get("code") != 200:
+        print(f"restore failed: {code} {body}", file=sys.stderr)
+        return 1
+    print(json.dumps(body["data"], indent=2))
+    return 0
+
+
+def cmd_metrics(args: argparse.Namespace) -> int:
+    s = _resolved_session(args)
+    code, body = _http("GET", f"{s['url']}/metrics", token=s["token"])
+    if code != 200:
+        print(f"metrics failed: {code}", file=sys.stderr)
+        return 1
+    print(body if isinstance(body, str) else json.dumps(body, indent=2))
+    return 0
+
+
+def cmd_databases(args: argparse.Namespace) -> int:
+    s = _resolved_session(args)
+    code, body = _http("GET", f"{s['url']}/api/v1/databases", token=s["token"])
+    if code != 200 or body.get("code") != 200:
+        print(f"failed: {code} {body}", file=sys.stderr)
+        return 1
+    for d in body["data"]["databases"]:
+        print(f"{d['name']:<24}  owner={d['owner']:<16}  "
+              f"collections={d['collection_count']}  ttl={d['default_ttl']}")
+    return 0
+
+
+def cmd_users(args: argparse.Namespace) -> int:
+    s = _resolved_session(args)
+    code, body = _http("GET", f"{s['url']}/api/v1/users", token=s["token"])
+    if code != 200 or body.get("code") != 200:
+        print(f"failed: {code} {body}", file=sys.stderr)
+        return 1
+    for u in body["data"]["users"]:
+        roles = ",".join(u.get("roles", []))
+        print(f"{u['username']:<20}  status={u['status']:<8}  roles={roles}")
+    return 0
+
+
+def _tail(path: Path, follow: bool) -> int:
+    if not path.exists():
+        print(f"not found: {path}", file=sys.stderr)
+        return 1
+    with path.open("r") as f:
+        # Print the existing tail, then optionally follow.
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - 65536))
+        sys.stdout.write(f.read())
+        sys.stdout.flush()
+        if not follow:
+            return 0
+        try:
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.4)
+                    continue
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        except KeyboardInterrupt:
+            return 0
+
+
+def cmd_audit_tail(args: argparse.Namespace) -> int:
+    return _tail(Path(args.data_dir) / "audit.log", args.follow)
+
+
+def cmd_slow_tail(args: argparse.Namespace) -> int:
+    return _tail(Path(args.data_dir) / "slow.log", args.follow)
+
+
+# ---------------------------------------------------------------------------
+# argparse
+# ---------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="delta-admin",
+        description="Operator CLI for a Delta cluster.")
+    p.add_argument("--url",   help="server base URL (overrides cached session)")
+    p.add_argument("--token", help="bearer token (overrides cached session)")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("login", help="acquire and cache a bearer token")
+    sp.add_argument("--user", required=True)
+    sp.add_argument("--password", required=True)
+    sp.set_defaults(func=cmd_login,
+                    url_required=True)
+
+    sp = sub.add_parser("backup", help="GET /admin/backup and save to disk")
+    sp.add_argument("--out", help="output file (default: delta-backup-<ts>.json)")
+    sp.set_defaults(func=cmd_backup)
+
+    sp = sub.add_parser("restore", help="POST a backup file to /admin/restore")
+    sp.add_argument("--in", dest="in_", required=True)
+    sp.set_defaults(func=cmd_restore)
+
+    sp = sub.add_parser("metrics", help="GET /metrics (Prometheus text)")
+    sp.set_defaults(func=cmd_metrics)
+
+    sp = sub.add_parser("databases", help="list databases (GET /databases)")
+    sp.set_defaults(func=cmd_databases)
+
+    sp = sub.add_parser("users", help="list users (GET /users)")
+    sp.set_defaults(func=cmd_users)
+
+    sp = sub.add_parser("audit-tail", help="tail the local audit.log JSONL file")
+    sp.add_argument("--data-dir", default="./data")
+    sp.add_argument("-f", "--follow", action="store_true")
+    sp.set_defaults(func=cmd_audit_tail)
+
+    sp = sub.add_parser("slow-tail", help="tail the local slow.log JSONL file")
+    sp.add_argument("--data-dir", default="./data")
+    sp.add_argument("-f", "--follow", action="store_true")
+    sp.set_defaults(func=cmd_slow_tail)
+
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.cmd == "login" and not args.url:
+        sys.exit("error: --url required for login")
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

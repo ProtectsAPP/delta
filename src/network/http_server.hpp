@@ -2,6 +2,8 @@
 #include "../core/common.hpp"
 #include "../core/collection.hpp"
 #include "../core/validation.hpp"
+#include "../core/logger.hpp"
+#include "../core/backup_crypto.hpp"
 #include "../cache/cache_engine.hpp"
 #include "../vector/hnsw_index.hpp"
 #include "../auth/auth_manager.hpp"
@@ -12,6 +14,9 @@
 #include <httplib.h>
 #include <fstream>
 #include <sstream>
+#include <array>
+#include <unordered_map>
+#include <shared_mutex>
 
 namespace delta::network {
 
@@ -20,6 +25,83 @@ struct HttpTuning {
     int keepalive_max = 1000;
     int keepalive_timeout = 30;
     int max_connections = 1024;
+    // Slow query threshold in milliseconds. Requests exceeding this are
+    // logged via Logger::slow() so the operator can find them in slow.log.
+    double slow_query_ms = 500.0;
+};
+
+// ----------------------------------------------------------------------------
+// LatencyHistogram — fixed-bucket per-path latency tally for /metrics. Buckets
+// follow the canonical Prometheus convention (le=1ms, 5ms, … , +Inf). One
+// atomic counter per bucket so writes are lock-free; the read path takes a
+// shared lock only to iterate `paths_`.
+// ----------------------------------------------------------------------------
+struct LatencyHistogram {
+    // Bucket upper bounds in milliseconds; +Inf is implicit (last cell).
+    static constexpr std::array<double, 14> BUCKETS = {
+        1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000
+    };
+    struct PathStats {
+        std::array<std::atomic<uint64_t>, BUCKETS.size() + 1> buckets{};
+        std::atomic<uint64_t> count{0};
+        std::atomic<double>  sum_ms{0.0};
+    };
+    // Bound the cardinality so a misbehaving client can't blow memory by
+    // crafting unique paths. Once full, additional paths fold into "other".
+    static constexpr size_t MAX_PATHS = 256;
+
+    void observe(const std::string& route, double ms) {
+        PathStats* p;
+        {
+            std::shared_lock<std::shared_mutex> lk(mu_);
+            auto it = paths_.find(route);
+            if (it != paths_.end()) p = &it->second;
+            else p = nullptr;
+        }
+        if (!p) {
+            std::unique_lock<std::shared_mutex> lk(mu_);
+            if (paths_.size() >= MAX_PATHS) {
+                p = &paths_["other"];
+            } else {
+                p = &paths_[route];
+            }
+        }
+        size_t b = BUCKETS.size();
+        for (size_t i = 0; i < BUCKETS.size(); ++i) {
+            if (ms <= BUCKETS[i]) { b = i; break; }
+        }
+        p->buckets[b].fetch_add(1, std::memory_order_relaxed);
+        p->count.fetch_add(1, std::memory_order_relaxed);
+        // No std::atomic<double>::fetch_add on older clang stdlib; CAS loop.
+        double cur = p->sum_ms.load(std::memory_order_relaxed);
+        while (!p->sum_ms.compare_exchange_weak(cur, cur + ms,
+                                                std::memory_order_relaxed)) {}
+    }
+
+    // Render Prometheus histogram lines into `out`.
+    void render(std::ostringstream& out) const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        out << "# HELP delta_http_request_duration_ms HTTP request latency.\n"
+            << "# TYPE delta_http_request_duration_ms histogram\n";
+        for (auto& [route, ps] : paths_) {
+            uint64_t cumulative = 0;
+            for (size_t i = 0; i < BUCKETS.size(); ++i) {
+                cumulative += ps.buckets[i].load(std::memory_order_relaxed);
+                out << "delta_http_request_duration_ms_bucket{path=\"" << route
+                    << "\",le=\"" << BUCKETS[i] << "\"} " << cumulative << "\n";
+            }
+            cumulative += ps.buckets[BUCKETS.size()].load(std::memory_order_relaxed);
+            out << "delta_http_request_duration_ms_bucket{path=\"" << route
+                << "\",le=\"+Inf\"} " << cumulative << "\n";
+            out << "delta_http_request_duration_ms_sum{path=\"" << route
+                << "\"} " << ps.sum_ms.load(std::memory_order_relaxed) << "\n";
+            out << "delta_http_request_duration_ms_count{path=\"" << route
+                << "\"} " << ps.count.load(std::memory_order_relaxed) << "\n";
+        }
+    }
+
+    mutable std::shared_mutex mu_;
+    std::unordered_map<std::string, PathStats> paths_;
 };
 
 class HttpServer {
@@ -106,20 +188,96 @@ private:
             ::setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
         });
 
-        // Trace request count + enforce replica read-only mode.
+        // Trace request count + enforce replica read-only mode + install a
+        // thread-local trace_id. Honors `X-Trace-Id` from the client when
+        // present (call-chain propagation), otherwise mints a fresh one and
+        // echoes it back via the same response header.
         srv_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
             req_count_.fetch_add(1, std::memory_order_relaxed);
+            std::string tid = req.get_header_value("X-Trace-Id");
+            if (tid.empty() || tid.size() > 64) tid = Logger::new_trace_id();
+            Logger::set_trace_id(tid);
+            res.set_header("X-Trace-Id", tid);
+            req_start_ms_slot() = (double)now_ms();
+            // Per-IP token-bucket rate limit. Disabled by default; turned on
+            // by main.cpp via set_conn_rate_limit().
+            if (!ip_rate_allow(req.remote_addr)) {
+                Logger::instance().audit("rate_limited",
+                    {{"ip", req.remote_addr}, {"path", req.path}, {"method", req.method}});
+                send_json(res, Status::FORBIDDEN,
+                          json{{"message", "rate limit exceeded"}, {"data", nullptr}});
+                Logger::clear_trace_id();
+                return httplib::Server::HandlerResponse::Handled;
+            }
             if (repl_ && repl_->read_only() && is_mutating(req)) {
-                // Replicas reject writes — caller should retry against master.
+                Logger::instance().info("replica_reject_write",
+                    {{"path", req.path}, {"method", req.method}});
                 send_json(res, Status::FORBIDDEN,
                           json{{"message", "this node is a read-only replica"},
                                {"data", nullptr},
                                {"master_url", repl_->master_url()},
                                {"role", role_name(repl_->role())}});
+                Logger::clear_trace_id();
                 return httplib::Server::HandlerResponse::Handled;
             }
             return httplib::Server::HandlerResponse::Unhandled;
         });
+
+        // Post-routing: latency observation + slow-query log + access log
+        // (DEBUG-level by default). Always clears the trace_id so it doesn't
+        // leak across reused worker threads.
+        srv_.set_post_routing_handler([this](const httplib::Request& req, const httplib::Response& res) {
+            double start = req_start_ms_slot();
+            double ms    = (double)now_ms() - start;
+            // Path-canonicalisation: collapse path-parameter slugs to keep
+            // cardinality bounded. We hash by the route's static prefix:
+            // /api/v1/collections/<x>/documents/<y> → /api/v1/collections/:c/documents/:id
+            std::string route = canonical_route(req.path);
+            req_latency_hist_.observe(route, ms);
+            int sc = res.status / 100;
+            if (sc >= 1 && sc <= 5) status_class_[sc].fetch_add(1, std::memory_order_relaxed);
+            Logger::instance().debug("http",
+                {{"method", req.method}, {"path", req.path}, {"status", res.status},
+                 {"ms", ms}, {"route", route}});
+            if (ms >= tuning_.slow_query_ms) {
+                Logger::instance().slow(ms, "http",
+                    {{"method", req.method}, {"path", req.path},
+                     {"status", res.status}, {"route", route}});
+            }
+            Logger::clear_trace_id();
+        });
+    }
+
+    // Thread-local request start timestamp (ms since epoch).
+    static double& req_start_ms_slot() { thread_local double t = 0; return t; }
+
+    // Collapse path parameters into stable buckets so the histogram doesn't
+    // explode when there are millions of doc ids. Conservative: only collapse
+    // segments that look like ids (hex/digits) or are too long.
+    static std::string canonical_route(const std::string& path) {
+        std::string out; out.reserve(path.size());
+        size_t i = 0;
+        while (i < path.size()) {
+            if (path[i] != '/') { out += path[i++]; continue; }
+            out += '/'; ++i;
+            size_t j = i;
+            while (j < path.size() && path[j] != '/') ++j;
+            std::string seg = path.substr(i, j - i);
+            bool is_id = !seg.empty() && (seg.size() >= 8);
+            if (is_id) {
+                bool all_hex = true;
+                for (char c : seg) {
+                    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                          (c >= 'A' && c <= 'F') || c == '-' || c == '_')) {
+                        all_hex = false; break;
+                    }
+                }
+                if (all_hex && seg.size() >= 16) seg = ":id";
+            }
+            out += seg;
+            i = j;
+        }
+        return out;
     }
     static bool is_mutating(const httplib::Request& req) {
         // Allow all GETs and the cluster control plane unconditionally.
@@ -140,6 +298,59 @@ private:
     int keepalive_max_count_ = 1000;
     int keepalive_timeout_sec_ = 30;
     std::atomic<uint64_t> req_count_{0};
+    // Per-route HTTP latency histogram, rendered into /metrics.
+    LatencyHistogram req_latency_hist_;
+    // Indexed by status_class (1..5) — 2xx, 3xx, 4xx, 5xx counters.
+    std::array<std::atomic<uint64_t>, 6> status_class_{};
+    // Per-IP token-bucket connection rate limiter. Configured via
+    // set_conn_rate_limit(); 0/0 disables.
+    struct IpBucket {
+        double tokens = 0.0;
+        double last_ms = 0.0;
+    };
+    std::mutex ip_rl_mu_;
+    std::unordered_map<std::string, IpBucket> ip_rl_;
+    std::atomic<int> ip_rl_rate_{0};       // tokens per second
+    std::atomic<int> ip_rl_burst_{0};      // bucket capacity
+    std::atomic<uint64_t> ip_rl_rejects_{0};
+public:
+    void set_backup_passphrase(const std::string& s) { backup_pass_ = s; }
+private:
+    std::string backup_pass_;
+public:
+    void set_conn_rate_limit(int per_sec, int burst) {
+        ip_rl_rate_.store(per_sec);
+        ip_rl_burst_.store(std::max(burst, per_sec));
+    }
+    uint64_t conn_rate_rejects() const { return ip_rl_rejects_.load(); }
+private:
+    // Returns true if the request is allowed under the per-IP budget.
+    bool ip_rate_allow(const std::string& ip) {
+        int rate  = ip_rl_rate_.load(std::memory_order_relaxed);
+        int burst = ip_rl_burst_.load(std::memory_order_relaxed);
+        if (rate <= 0 || burst <= 0) return true;
+        double now = (double)now_ms();
+        std::lock_guard<std::mutex> lk(ip_rl_mu_);
+        // Periodically prune cold buckets so the map doesn't grow unbounded.
+        if (ip_rl_.size() > 50000) {
+            for (auto it = ip_rl_.begin(); it != ip_rl_.end(); ) {
+                if (now - it->second.last_ms > 60000.0) it = ip_rl_.erase(it);
+                else ++it;
+            }
+        }
+        auto& b = ip_rl_[ip];
+        if (b.last_ms == 0.0) { b.tokens = (double)burst; b.last_ms = now; }
+        double elapsed = (now - b.last_ms) / 1000.0;
+        b.tokens = std::min((double)burst, b.tokens + elapsed * (double)rate);
+        b.last_ms = now;
+        if (b.tokens < 1.0) {
+            ip_rl_rejects_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        b.tokens -= 1.0;
+        return true;
+    }
+public:
     // P0-9: empty by default — wide-open `*` for dev. Operators turn on
     // strict allow-list mode by calling set_cors() before listen().
     CorsPolicy cors_;
@@ -302,6 +513,8 @@ private:
             // also rate-limit at the reverse proxy in production).
             std::string rl_key = req.remote_addr + "|" + user;
             if (!login_limiter_.allow(rl_key)) {
+                Logger::instance().audit("login_rate_limited",
+                    {{"user", user}, {"ip", req.remote_addr}});
                 // 429 isn't in our Status enum; reuse FORBIDDEN with a clear
                 // message so the audit log captures it correctly.
                 err(res, Status::FORBIDDEN, "too many login attempts; try again later");
@@ -309,8 +522,14 @@ private:
             }
             std::string er;
             // P0-8 surfaces a uniform message; we just propagate it.
-            if (!auth_->authenticate(user, pw, &er)) { err(res, Status::UNAUTHORIZED, er); return; }
+            if (!auth_->authenticate(user, pw, &er)) {
+                Logger::instance().audit("login_failed",
+                    {{"user", user}, {"ip", req.remote_addr}, {"reason", er}});
+                err(res, Status::UNAUTHORIZED, er); return;
+            }
             login_limiter_.reset(rl_key);  // success clears the budget for this key
+            Logger::instance().audit("login_succeeded",
+                {{"user", user}, {"ip", req.remote_addr}});
             auto u = auth_->get_user(user).value();
             auth_->record_login_ip(user, req.remote_addr);
             std::string db = b.value("database", u.default_database.empty() ? "default" : u.default_database);
@@ -322,7 +541,10 @@ private:
         });
         srv_.Post("/api/v1/auth/logout", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
-            sessions_->revoke(s.token); ok(res, json{{"ok", true}});
+            sessions_->revoke(s.token);
+            Logger::instance().audit("logout",
+                {{"user", s.username}, {"ip", req.remote_addr}});
+            ok(res, json{{"ok", true}});
         });
         srv_.Get("/api/v1/auth/me", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
@@ -960,23 +1182,60 @@ private:
         // migrations between deployments / regions.
         srv_.Get("/api/v1/admin/backup", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
-            if (!auth_->is_superuser(s.username)) { err(res, Status::FORBIDDEN, "superuser only"); return; }
+            if (!auth_->is_superuser(s.username)) {
+                Logger::instance().audit("backup_denied",
+                    {{"user", s.username}, {"ip", req.remote_addr}});
+                err(res, Status::FORBIDDEN, "superuser only"); return;
+            }
+            Logger::instance().audit("backup",
+                {{"user", s.username}, {"ip", req.remote_addr},
+                 {"encrypted", !backup_pass_.empty()}});
             uint64_t lsn = store_->current_lsn();
             json recs = json::array();
             for (auto& [k, v] : store_->prefix_scan("", 100000000)) {
                 recs.push_back({{"key", k}, {"value", v}});
             }
-            ok(res, json{{"lsn", lsn},
-                         {"records", recs},
-                         {"count", recs.size()},
-                         {"timestamp_ms", now_ms()},
-                         {"version", "1.0.0"}});
+            json payload = {{"lsn", lsn},
+                            {"records", recs},
+                            {"count", recs.size()},
+                            {"timestamp_ms", now_ms()},
+                            {"version", "1.0.0"}};
+            if (!backup_pass_.empty()) {
+                ok(res, backup_crypto::encrypt(backup_pass_, payload.dump()));
+            } else {
+                ok(res, payload);
+            }
         });
 
         srv_.Post("/api/v1/admin/restore", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
-            if (!auth_->is_superuser(s.username)) { err(res, Status::FORBIDDEN, "superuser only"); return; }
+            if (!auth_->is_superuser(s.username)) {
+                Logger::instance().audit("restore_denied",
+                    {{"user", s.username}, {"ip", req.remote_addr}});
+                err(res, Status::FORBIDDEN, "superuser only"); return;
+            }
+            Logger::instance().audit("restore_start",
+                {{"user", s.username}, {"ip", req.remote_addr}});
             json b = parse_body(req);
+            // Accept either the plain dump or the encrypted envelope. The
+            // envelope is identified by `format == "delta-backup-1-encrypted"`.
+            if (b.value("format", "") == "delta-backup-1-encrypted") {
+                if (backup_pass_.empty()) {
+                    err(res, Status::INVALID,
+                        "encrypted backup but no --backup-passphrase configured");
+                    return;
+                }
+                try {
+                    std::string pt = backup_crypto::decrypt(backup_pass_, b);
+                    b = json::parse(pt);
+                } catch (const std::exception& e) {
+                    Logger::instance().audit("restore_decrypt_failed",
+                        {{"user", s.username}, {"ip", req.remote_addr},
+                         {"error", e.what()}});
+                    err(res, Status::INVALID, std::string("decrypt failed: ") + e.what());
+                    return;
+                }
+            }
             if (!b.contains("records") || !b["records"].is_array()) {
                 err(res, Status::INVALID, "missing `records` array");
                 return;
@@ -1040,9 +1299,37 @@ private:
             line("delta_connections_total",    "Total registered client connections.",     "gauge",   (double)pool_->total());
             line("delta_connections_active",   "Currently active connections.",            "gauge",   (double)pool_->active());
             line("delta_http_threads",         "HTTP worker thread count.",                "gauge",   (double)thread_count_);
+
+            // Per-status-class counters
+            for (int sc = 1; sc <= 5; ++sc) {
+                m << "delta_http_responses_total{class=\"" << sc << "xx\"} "
+                  << status_class_[sc].load(std::memory_order_relaxed) << "\n";
+            }
+            line("delta_http_rate_limited_total",
+                 "HTTP requests rejected by the per-IP token bucket.",
+                 "counter",
+                 (double)ip_rl_rejects_.load(std::memory_order_relaxed));
+            // Latency histogram (one bucket-set per route)
+            req_latency_hist_.render(m);
+
+            // WebSocket + DeltaQL traffic counters (injected by main.cpp via
+            // set_traffic_hook). Default-empty hook means "no extra lines".
+            if (traffic_hook_) traffic_hook_(m);
+
             res.set_content(m.str(), "text/plain; version=0.0.4; charset=utf-8");
         });
     }
+
+public:
+    // Setter for the supplementary metrics emitted by the WS and DeltaQL
+    // servers. Called from main.cpp after those servers are constructed so
+    // their atomic counters can be read here without pulling those headers
+    // into this file. Signature: void(std::ostringstream&).
+    using TrafficHook = std::function<void(std::ostringstream&)>;
+    void set_traffic_hook(TrafficHook fn) { traffic_hook_ = std::move(fn); }
+
+private:
+    TrafficHook traffic_hook_;
 
     // ------------------------------------------------------------------
     // Cluster / replication control plane.

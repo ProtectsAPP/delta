@@ -1,6 +1,7 @@
 #include "config.hpp"
 #include "../storage/lsm_tree.hpp"
 #include "../core/collection.hpp"
+#include "../core/logger.hpp"
 #include "../cache/cache_engine.hpp"
 #include "../vector/hnsw_index.hpp"
 #include "../auth/auth_manager.hpp"
@@ -14,6 +15,7 @@
 #include <thread>
 #include <chrono>
 #include <csignal>
+#include <filesystem>
 
 using namespace delta;
 
@@ -28,6 +30,22 @@ static void on_sig(int) { g_shutdown_requested.store(1, std::memory_order_relaxe
 int main(int argc, char** argv) {
     auto cfg = server::ServerConfig::from_args(argc, argv);
     std::cout << "[Delta] starting with config: " << cfg.to_json().dump() << std::endl;
+
+    // Configure the structured logger: level from --log-level / DELTA_LOG_LEVEL
+    // (falls back to INFO), audit/slow/main files inside the data dir.
+    {
+        Logger& lg = Logger::instance();
+        lg.set_level(log_level_from_string(cfg.log_level));
+        std::filesystem::create_directories(cfg.data_dir);
+        lg.set_audit_file(cfg.data_dir + "/audit.log");
+        lg.set_slow_query_file(cfg.data_dir + "/slow.log");
+        if (!cfg.log_file.empty()) lg.set_main_file(cfg.log_file);
+        lg.info("boot", json{{"role", cfg.role},
+                              {"http_port", cfg.http_port},
+                              {"deltaql_port", cfg.deltaql_port},
+                              {"ws_port", cfg.ws_port},
+                              {"data_dir", cfg.data_dir}});
+    }
 
     auto store = std::make_unique<storage::LSMTree>(cfg.data_dir);
     auto col = std::make_unique<CollectionEngine>(store.get());
@@ -58,6 +76,8 @@ int main(int argc, char** argv) {
     network::Role role = network::Role::Standalone;
     if (cfg.role == "master") role = network::Role::Master;
     else if (cfg.role == "replica") role = network::Role::Replica;
+    // Make the slow-query threshold tunable via config; default 500ms preserved.
+    // (Done via Tuning below so it threads through to set_post_routing_handler.)
     auto repl = std::make_unique<network::ReplicationManager>(
         store.get(), role, cfg.master_url, cfg.cluster_token);
     if (role == network::Role::Replica) {
@@ -72,9 +92,25 @@ int main(int argc, char** argv) {
     }
 
     network::HttpServer::Tuning ht{cfg.http_threads, cfg.keepalive_max_count,
-                                    cfg.keepalive_timeout_sec, cfg.max_connections};
+                                    cfg.keepalive_timeout_sec, cfg.max_connections,
+                                    cfg.slow_query_ms};
     network::HttpServer server(store.get(), col.get(), cache.get(), vec.get(),
                                 auth.get(), sessions.get(), dbm.get(), pool.get(), ht, repl.get());
+
+    // Surface WS + DeltaQL traffic counters through HTTP /metrics. We capture
+    // by reference into the singletons declared in their respective headers.
+    server.set_traffic_hook([](std::ostringstream& m){
+        auto emit = [&](const char* base, auto& c){
+            m << "delta_" << base << "_frames_sent_total " << c.frames_sent.load() << "\n";
+            m << "delta_" << base << "_frames_recv_total " << c.frames_recv.load() << "\n";
+            m << "delta_" << base << "_bytes_sent_total "  << c.bytes_sent.load()  << "\n";
+            m << "delta_" << base << "_bytes_recv_total "  << c.bytes_recv.load()  << "\n";
+            m << "delta_" << base << "_connections_total " << c.total_conns.load() << "\n";
+            m << "delta_" << base << "_connections_active "<< c.active_conns.load()<< "\n";
+        };
+        emit("ws",      network::ws::ws_traffic());
+        emit("deltaql", network::dql_traffic());
+    });
 
     // P0-9: hand the CORS allow-list off to the HTTP layer. Empty list keeps
     // the legacy permissive `*` behavior; a non-empty list enables strict
@@ -83,6 +119,31 @@ int main(int argc, char** argv) {
     cp.origins           = cfg.cors.allowed_origins;
     cp.allow_credentials = cfg.cors.allow_credentials;
     server.set_cors(cp);
+
+    if (!cfg.backup_passphrase.empty()) {
+        server.set_backup_passphrase(cfg.backup_passphrase);
+        Logger::instance().info("backup_encryption_enabled", json::object());
+    }
+    if (cfg.conn_rate_per_sec > 0) {
+        server.set_conn_rate_limit(cfg.conn_rate_per_sec, cfg.conn_rate_burst);
+        Logger::instance().info("conn_rate_limit_enabled",
+            json{{"per_sec", cfg.conn_rate_per_sec},
+                 {"burst",   cfg.conn_rate_burst}});
+    }
+    if (!cfg.tls_cert.empty() || !cfg.tls_key.empty()) {
+        // TLS termination requires building cpp-httplib with
+        // CPPHTTPLIB_OPENSSL_SUPPORT, which our default build does not enable
+        // (keeps the binary OpenSSL-free for distros without libssl). For
+        // production, terminate TLS at a reverse proxy (nginx, Envoy, ALB,
+        // Cloudflare). The config fields are accepted so an OpenSSL-enabled
+        // custom build can wire them in without further changes.
+        std::cerr << "[Delta][WARN] --tls-cert/--tls-key set but this build "
+                     "lacks OpenSSL support. Terminate TLS at a reverse proxy "
+                     "or rebuild with CPPHTTPLIB_OPENSSL_SUPPORT=1.\n";
+        Logger::instance().warn("tls_unavailable",
+            json{{"cert_set", !cfg.tls_cert.empty()},
+                 {"key_set",  !cfg.tls_key.empty()}});
+    }
 
     // P1-24: refuse to silently expose cluster admin endpoints with no token.
     // We don't *fail* startup so single-node dev still works, but we shout.

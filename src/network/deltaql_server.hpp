@@ -107,6 +107,17 @@ private:
     int         port_;
 };
 
+// Namespace-scope traffic counters surfaced by HttpServer::set_traffic_hook.
+struct DqlTrafficCounters {
+    std::atomic<uint64_t> frames_sent{0};
+    std::atomic<uint64_t> frames_recv{0};
+    std::atomic<uint64_t> bytes_sent{0};
+    std::atomic<uint64_t> bytes_recv{0};
+    std::atomic<uint64_t> total_conns{0};
+    std::atomic<uint64_t> active_conns{0};
+};
+inline DqlTrafficCounters& dql_traffic() { static DqlTrafficCounters g; return g; }
+
 // ---------------------------------------------------------------------------
 // One DeltaQL connection. Owns a reader and a writer thread.
 // ---------------------------------------------------------------------------
@@ -185,6 +196,9 @@ private:
             if (plen > dql::MAX_FRAME) { send_error(0, "frame too large"); return; }
             std::string payload(plen, '\0');
             if (plen && !read_exact((uint8_t*)payload.data(), plen)) return;
+            dql_traffic().frames_recv.fetch_add(1, std::memory_order_relaxed);
+            dql_traffic().bytes_recv.fetch_add(dql::HEADER_LEN + plen,
+                                               std::memory_order_relaxed);
             dql::Frame in;
             try {
                 in = dql::parse_header_and_take_payload(hdr, std::move(payload));
@@ -221,6 +235,8 @@ private:
             }
             off += (size_t)w;
         }
+        dql_traffic().frames_sent.fetch_add(1, std::memory_order_relaxed);
+        dql_traffic().bytes_sent.fetch_add(buf.size(), std::memory_order_relaxed);
     }
     void send_error(uint32_t rid, const std::string& msg) {
         json j = {{"code", -1}, {"message", msg}};
@@ -405,9 +421,12 @@ private:
             }
             auto conn = std::make_shared<DqlConnection>(fd, lb_, cache_);
             register_conn(conn);
+            dql_traffic().total_conns.fetch_add(1, std::memory_order_relaxed);
+            dql_traffic().active_conns.fetch_add(1, std::memory_order_relaxed);
             std::thread([this, conn]() {
                 conn->start();
                 unregister_conn(conn);
+                dql_traffic().active_conns.fetch_sub(1, std::memory_order_relaxed);
             }).detach();
         }
     }

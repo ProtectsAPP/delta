@@ -94,6 +94,17 @@ inline std::string accept_key(const std::string& client_key) {
 }
 
 // ---- one connection ----
+// Namespace-scope traffic counters surfaced by HttpServer::set_traffic_hook.
+struct WsTrafficCounters {
+    std::atomic<uint64_t> frames_sent{0};
+    std::atomic<uint64_t> frames_recv{0};
+    std::atomic<uint64_t> bytes_sent{0};
+    std::atomic<uint64_t> bytes_recv{0};
+    std::atomic<uint64_t> total_conns{0};
+    std::atomic<uint64_t> active_conns{0};
+};
+inline WsTrafficCounters& ws_traffic() { static WsTrafficCounters g; return g; }
+
 class WsConnection : public std::enable_shared_from_this<WsConnection> {
 public:
     WsConnection(int fd, HttpLoopback* lb, cache::CacheEngine* cache)
@@ -203,6 +214,9 @@ private:
         }
         if (!write_all(hdr.data(), hdr.size())) return false;
         if (!payload.empty() && !write_all((const uint8_t*)payload.data(), payload.size())) return false;
+        ws_traffic().frames_sent.fetch_add(1, std::memory_order_relaxed);
+        ws_traffic().bytes_sent.fetch_add(hdr.size() + payload.size(),
+                                          std::memory_order_relaxed);
         return true;
     }
 
@@ -240,6 +254,8 @@ private:
             if (op == 0xA) continue;                       // pong, ignore
             if (first_op == -1 && op != 0x0) first_op = op;
             out.append(chunk);
+            ws_traffic().frames_recv.fetch_add(1, std::memory_order_relaxed);
+            ws_traffic().bytes_recv.fetch_add(plen, std::memory_order_relaxed);
         }
         return first_op;
     }
@@ -393,11 +409,14 @@ private:
             if (fd < 0) { if (!running_) return; continue; }
             auto conn = std::make_shared<WsConnection>(fd, lb_, cache_);
             { std::lock_guard<std::mutex> g(conns_mu_); conns_.push_back(conn); }
+            ws_traffic().total_conns.fetch_add(1, std::memory_order_relaxed);
+            ws_traffic().active_conns.fetch_add(1, std::memory_order_relaxed);
             std::thread([this, conn]() {
                 conn->start();
                 std::lock_guard<std::mutex> g(conns_mu_);
                 conns_.erase(std::remove_if(conns_.begin(), conns_.end(),
                     [&](auto& p){ return p.get() == conn.get(); }), conns_.end());
+                ws_traffic().active_conns.fetch_sub(1, std::memory_order_relaxed);
             }).detach();
         }
     }

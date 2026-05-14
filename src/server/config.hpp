@@ -60,6 +60,27 @@ struct ServerConfig {
     // P0-9: CORS policy applied to the HTTP listener.
     CorsConfig cors;
 
+    // Logger.
+    std::string log_level = "info";    // debug | info | warn | error | off
+    std::string log_file;              // optional path to mirror stderr into
+
+    // Observability.
+    double slow_query_ms = 500.0;      // anything >= this duration -> slow.log
+
+    // Connection rate limit at the HTTP intake (per remote IP, token bucket).
+    // 0 disables. Bucket refills `conn_rate_per_sec` tokens per second and
+    // is capped at `conn_rate_burst` tokens.
+    int conn_rate_per_sec = 0;
+    int conn_rate_burst   = 0;
+
+    // TLS (cpp-httplib OpenSSL build). Empty = plain HTTP.
+    std::string tls_cert;
+    std::string tls_key;
+
+    // Backup encryption: optional AES-256-GCM passphrase applied to the
+    // /admin/backup payload. Empty = unencrypted JSON.
+    std::string backup_passphrase;
+
     // to_json() never includes cluster_token — it lands in startup logs.
     json to_json() const {
         return {
