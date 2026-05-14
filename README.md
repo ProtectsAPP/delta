@@ -104,7 +104,7 @@ Data: `/data` inside the container (== `~/.deltaql` for the in-container user).
 | --- | --- |
 | **Documents** | Collection CRUD; nested-field queries (`address.city`); `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists/$regex/$contains`; `$and/$or/$nor`; sort; pagination; projection; bulk insert |
 | **Updates** | `$set / $unset / $inc / $mul / $push / $pull / $addToSet / $rename` |
-| **Aggregation** | `$match / $group / $sort / $limit / $skip` with `$sum / $avg / $min / $max / $count` |
+| **Aggregation** | `$match / $group / $sort / $limit / $skip / $project / $unwind / $lookup` with `$sum / $avg / $min / $max / $count` |
 | **Indexes** | B+ tree / hash / full-text / vector; unique constraints; auto-maintained |
 | **Storage** | LSM-Tree (MemTable + SSTable + WAL); crash recovery |
 | **Cache** | String / Hash / List / Set / Sorted Set / Pub-Sub / TTL / LRU eviction / counters |

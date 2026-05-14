@@ -357,7 +357,9 @@ public:
         return plan_query(cm, filter, ids);
     }
 
-    // simple aggregation pipeline: $match, $group, $sort, $limit, $project
+    // Aggregation pipeline. Stages: $match, $group, $sort, $limit, $skip,
+    // $project, $unwind, $lookup. See implementation below for per-stage
+    // semantics.
     json aggregate(const std::string& db, const std::string& sch, const std::string& col, const json& pipeline) {
         std::shared_lock<std::shared_mutex> lk(mu_);  // P0-5
         std::vector<json> docs;
@@ -503,6 +505,72 @@ public:
                     }
                 }
                 docs = std::move(out);
+            } else if (stage.contains("$lookup")) {
+                // Equi-join from `from` collection, MongoDB-compatible.
+                //   {"$lookup": {
+                //       "from":         "<collection>",
+                //       "localField":   "<path in current doc>",
+                //       "foreignField": "<path in `from` doc>",
+                //       "as":           "<output array field>"
+                //   }}
+                //
+                // Semantics:
+                //   * `from` is resolved in the same db+schema as the current
+                //     pipeline's collection. Cross-db / cross-schema joins are
+                //     out of scope for v1.
+                //   * If the local value is an array, every element is matched
+                //     against `foreignField` (Mongo behaviour).
+                //   * `as` always becomes an array, even on a single match
+                //     (Mongo behaviour). Empty array means no match.
+                //   * The `from` collection is loaded once per stage and
+                //     hash-indexed by `foreignField`, so the cost is
+                //     O(|from| + |docs| * avg_matches), not the naive
+                //     O(|from| * |docs|).
+                //
+                // Locking: we already hold a shared lock on `mu_` for the
+                //   pipeline; the prefix_scan below is read-only and reuses
+                //   it, so no extra synchronisation is needed.
+                const json& spec = stage["$lookup"];
+                std::string from   = spec.value("from",         std::string());
+                std::string lfield = spec.value("localField",   std::string());
+                std::string ffield = spec.value("foreignField", std::string());
+                std::string asfld  = spec.value("as",           std::string());
+                if (from.empty() || lfield.empty() || ffield.empty() || asfld.empty()) {
+                    // Bad spec: pass docs through unchanged rather than throw,
+                    // matching the engine's tolerant style for malformed stages.
+                    continue;
+                }
+                // Build hash index over the `from` collection on `foreignField`.
+                // We use json::dump() as the hash key to handle string / number /
+                // bool / null uniformly without writing a json hasher.
+                std::unordered_map<std::string, std::vector<json>> idx;
+                for (auto& [k, v] : store_->prefix_scan(doc_prefix(db, sch, from), 1000000)) {
+                    json fdoc;
+                    try { fdoc = json::parse(v)["data"]; } catch(...) { continue; }
+                    json fv = FilterMatcher::get_field(fdoc, ffield);
+                    if (fv.is_array()) {
+                        for (auto& el : fv) idx[el.dump()].push_back(fdoc);
+                    } else if (!fv.is_null()) {
+                        idx[fv.dump()].push_back(fdoc);
+                    }
+                }
+                // Probe each input doc against the hash index.
+                for (auto& d : docs) {
+                    json lv = FilterMatcher::get_field(d, lfield);
+                    json matches = json::array();
+                    auto probe = [&](const json& key) {
+                        auto it = idx.find(key.dump());
+                        if (it != idx.end()) {
+                            for (auto& m : it->second) matches.push_back(m);
+                        }
+                    };
+                    if (lv.is_array()) {
+                        for (auto& el : lv) probe(el);
+                    } else if (!lv.is_null()) {
+                        probe(lv);
+                    }
+                    UpdateApplier::set_field(d, asfld, matches);
+                }
             }
         }
         return docs;
