@@ -275,32 +275,38 @@ void RaftNode::start_election(bool dry_run) {
     }
 
     // Self counts as one yes vote.
-    int yes = 1;
+    std::atomic<int> yes{1};
     int total_peers = (int)peers.size();
     int needed = total_peers / 2 + 1;             // strict majority
 
+    // Fan out vote requests concurrently. Serial dispatch slows the round
+    // by N * rpc_timeout when one peer is dead, which can starve a healthy
+    // election.
+    std::vector<std::thread> workers;
+    workers.reserve(peers.size());
+    std::atomic<bool> stepped_down{false};
     for (auto& peer : peers) {
         if (peer == self) continue;
-        RequestVoteReply rep;
-        // Note: serial dispatch keeps the implementation simple; for
-        // production-grade latency we'd want concurrent send_request_vote.
-        // For 3-5 node clusters with a 50 ms RPC timeout this is well
-        // within election_min_ms.
-        bool delivered = tx_->send_request_vote(peer, base, &rep);
-        if (!delivered) continue;
-
-        std::unique_lock<std::shared_mutex> lk(mu_);
-        // §5.1 stale-term: stepping down trumps any reply contents.
-        if (rep.term > current_term_) {
-            become_follower(rep.term, /*leader=*/"");
-            return;
-        }
-        // Ignore replies from stale rounds (we may have moved on).
-        if (!dry_run && role_ != Role::Candidate) return;
-        if (rep.vote_granted) yes++;
+        workers.emplace_back([this, peer, base, dry_run,
+                              &yes, &stepped_down]() {
+            RequestVoteReply rep;
+            bool delivered = tx_->send_request_vote(peer, base, &rep);
+            if (!delivered) return;
+            std::unique_lock<std::shared_mutex> lk(mu_);
+            if (rep.term > current_term_) {
+                become_follower(rep.term, /*leader=*/"");
+                stepped_down.store(true);
+                return;
+            }
+            if (!dry_run && role_ != Role::Candidate) return;
+            if (rep.vote_granted) yes.fetch_add(1);
+        });
     }
+    for (auto& w : workers) if (w.joinable()) w.join();
 
-    if (yes < needed) {
+    if (stepped_down.load()) return;
+
+    if (yes.load() < needed) {
         // Lost (or tied). Reset deadline and wait for the next election
         // cycle. The persisted current_term bump (in the non-dry case)
         // stays — that's how Raft prevents perpetual ties from a single
@@ -348,6 +354,12 @@ void RaftNode::broadcast_append_entries() {
         next_idx_snapshot = next_index_;
     }
 
+    // Fan out concurrently. A dead peer that takes the full RPC timeout to
+    // fail must NOT slow down delivery to live peers — so each peer gets a
+    // dedicated thread for this round. The threads join before this method
+    // returns to keep ordering simple.
+    std::vector<std::thread> workers;
+    workers.reserve(peers.size());
     for (auto& peer : peers) {
         if (peer == self) continue;
         Index ni = 1;
@@ -355,51 +367,51 @@ void RaftNode::broadcast_append_entries() {
         if (it != next_idx_snapshot.end()) ni = it->second;
         if (ni < 1) ni = 1;
 
-        AppendEntriesArgs args;
-        args.term      = current_term;
-        args.leader_id = self;
-        // prev = entry just before next_index. log_snapshot[ni - 1] is the
-        // previous because log is 1-indexed (sentinel at slot 0).
-        Index prev_idx = ni - 1;
-        if (prev_idx >= log_snapshot.size()) prev_idx = log_snapshot.size() - 1;
-        args.prev_log_index = log_snapshot[prev_idx].index;
-        args.prev_log_term  = log_snapshot[prev_idx].term;
-        // Entries from ni..end.
-        for (Index i = ni; i < log_snapshot.size(); ++i) {
-            args.entries.push_back(log_snapshot[i]);
-        }
-        args.leader_commit = leader_commit;
-
-        AppendEntriesReply rep;
-        bool delivered = tx_->send_append_entries(peer, args, &rep);
-        if (!delivered) continue;
-
-        std::unique_lock<std::shared_mutex> lk(mu_);
-        // §5.1: a higher term means we've been deposed.
-        if (rep.term > current_term_) {
-            become_follower(rep.term, /*leader=*/"");
-            return;
-        }
-        if (role_ != Role::Leader || current_term_ != current_term) return;
-
-        if (rep.success) {
-            Index new_match = args.prev_log_index + (Index)args.entries.size();
-            if (new_match > match_index_[peer]) match_index_[peer] = new_match;
-            next_index_[peer] = match_index_[peer] + 1;
-            maybe_advance_commit_index_locked();
-        } else {
-            // §5.3 fast-rollback: jump next_index to the conflict hint
-            // rather than decrementing by one. Bound at 1.
-            Index back = next_index_[peer];
-            if (rep.conflict_index > 0 && rep.conflict_index < back) {
-                back = rep.conflict_index;
-            } else if (back > 1) {
-                back--;
+        workers.emplace_back([this, peer, ni, current_term, self,
+                              leader_commit, log_snapshot]() mutable {
+            AppendEntriesArgs args;
+            args.term      = current_term;
+            args.leader_id = self;
+            Index prev_idx = ni - 1;
+            if (prev_idx >= log_snapshot.size()) prev_idx = log_snapshot.size() - 1;
+            args.prev_log_index = log_snapshot[prev_idx].index;
+            args.prev_log_term  = log_snapshot[prev_idx].term;
+            for (Index i = ni; i < log_snapshot.size(); ++i) {
+                args.entries.push_back(log_snapshot[i]);
             }
-            if (back < 1) back = 1;
-            next_index_[peer] = back;
-        }
+            args.leader_commit = leader_commit;
+
+            AppendEntriesReply rep;
+            bool delivered = tx_->send_append_entries(peer, args, &rep);
+            if (!delivered) return;
+
+            std::unique_lock<std::shared_mutex> lk(mu_);
+            // §5.1: a higher term means we've been deposed.
+            if (rep.term > current_term_) {
+                become_follower(rep.term, /*leader=*/"");
+                return;
+            }
+            if (role_ != Role::Leader || current_term_ != current_term) return;
+
+            if (rep.success) {
+                Index new_match = args.prev_log_index + (Index)args.entries.size();
+                if (new_match > match_index_[peer]) match_index_[peer] = new_match;
+                next_index_[peer] = match_index_[peer] + 1;
+                maybe_advance_commit_index_locked();
+            } else {
+                // §5.3 fast-rollback.
+                Index back = next_index_[peer];
+                if (rep.conflict_index > 0 && rep.conflict_index < back) {
+                    back = rep.conflict_index;
+                } else if (back > 1) {
+                    back--;
+                }
+                if (back < 1) back = 1;
+                next_index_[peer] = back;
+            }
+        });
     }
+    for (auto& w : workers) if (w.joinable()) w.join();
 }
 
 void RaftNode::maybe_advance_commit_index_locked() {

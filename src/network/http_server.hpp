@@ -11,6 +11,7 @@
 #include "../database/database_manager.hpp"
 #include "connection_pool.hpp"
 #include "replication.hpp"
+#include "raft.hpp"
 #include <algorithm>
 #include <httplib.h>
 #include <fstream>
@@ -169,6 +170,11 @@ public:
     }
 
     bool tls_enabled() const { return tls_enabled_; }
+
+    // Plug in a RaftNode. When set, the /api/v1/cluster/raft/* endpoints
+    // become live and route incoming RPCs into raft->handle_*. Plug it
+    // BEFORE listen() (the route registration is one-shot in setup_cluster_routes).
+    void set_raft(raft::RaftNode* r) { raft_ = r; }
 
     void listen(const std::string& host, int port) {
         std::cout << "[Delta] HTTP listening on " << host << ":" << port
@@ -433,6 +439,7 @@ private:
     database::DatabaseManager* dbm_;
     ConnectionPool* pool_;
     ReplicationManager* repl_;
+    raft::RaftNode* raft_ = nullptr;
     // P2-2 (TLS): we keep a unique_ptr that owns either a plain
     // httplib::Server or, when DELTA_TLS=ON and enable_tls() was called
     // before listen(), an httplib::SSLServer. The reference srv_ binds to
@@ -1513,6 +1520,16 @@ private:
     // can run replication without needing a service account.
     // ------------------------------------------------------------------
     void setup_cluster_routes() {
+        // Legacy master/replica streaming. Only registered when repl_ is set
+        // (the standalone build has no ReplicationManager).
+        if (repl_) setup_legacy_replication_routes();
+        // Raft routes are independent of repl_; they only need raft_ to be
+        // installed via set_raft(). When raft_ is null the routes return
+        // 503, so a misconfigured setup can't silently cast votes.
+        setup_raft_routes();
+    }
+
+    void setup_legacy_replication_routes() {
         if (!repl_) return;
 
         auto check_token = [this](const httplib::Request& req, httplib::Response& res) -> bool {
@@ -1582,6 +1599,125 @@ private:
             repl_->demote_to_replica(url);
             ok(res, json{{"role", role_name(repl_->role())}, {"master_url", url}});
         });
+    }
+
+    // ------------------------------------------------------------------
+    // Raft control plane (Round 2 part 2).
+    //
+    // POST /api/v1/cluster/raft/vote     RequestVote   (peer-to-peer)
+    // POST /api/v1/cluster/raft/append   AppendEntries (peer-to-peer)
+    // GET  /api/v1/cluster/raft/status   introspection (no token gate;
+    //                                                   read-only)
+    //
+    // The peer-to-peer endpoints share the cluster_token gate already used
+    // by /cluster/changes etc. — operators with a single shared secret get
+    // both legacy replication and raft RPC for free.
+    //
+    // When set_raft() was never called, all four endpoints return HTTP 503
+    // so a misconfigured cluster can't silently progress.
+    // ------------------------------------------------------------------
+    void setup_raft_routes() {
+        // The cluster token is owned by the legacy replication manager when
+        // present, otherwise the raft endpoints simply require any header
+        // value to be empty. Operators wiring raft without legacy replication
+        // should keep cluster_token configured the same way.
+        auto token_check = [this](const httplib::Request& req,
+                                  httplib::Response& res) -> bool {
+            std::string expected = repl_ ? repl_->token() : std::string();
+            if (expected.empty()) return true;
+            auto got = req.get_header_value("X-Delta-Cluster-Token");
+            if (got != expected) {
+                err(res, Status::UNAUTHORIZED, "invalid cluster token");
+                return false;
+            }
+            return true;
+        };
+
+        srv_.Post("/api/v1/cluster/raft/vote",
+            [this, token_check](const httplib::Request& req, httplib::Response& res) {
+                if (!token_check(req, res)) return;
+                if (!raft_) { err(res, 503, "raft not configured"); return; }
+                json b = parse_body(req);
+                raft::RequestVoteArgs a;
+                a.term            = b.value("term", (raft::Term)0);
+                a.candidate_id    = b.value("candidate_id", std::string());
+                a.last_log_index  = b.value("last_log_index", (raft::Index)0);
+                a.last_log_term   = b.value("last_log_term",  (raft::Term)0);
+                a.pre_vote        = b.value("pre_vote", false);
+                raft::RequestVoteReply r;
+                raft_->handle_request_vote(a, &r);
+                ok(res, json{{"term", r.term}, {"vote_granted", r.vote_granted}});
+            });
+
+        srv_.Post("/api/v1/cluster/raft/append",
+            [this, token_check](const httplib::Request& req, httplib::Response& res) {
+                if (!token_check(req, res)) return;
+                if (!raft_) { err(res, 503, "raft not configured"); return; }
+                json b = parse_body(req);
+                raft::AppendEntriesArgs a;
+                a.term            = b.value("term", (raft::Term)0);
+                a.leader_id       = b.value("leader_id", std::string());
+                a.prev_log_index  = b.value("prev_log_index", (raft::Index)0);
+                a.prev_log_term   = b.value("prev_log_term",  (raft::Term)0);
+                a.leader_commit   = b.value("leader_commit",  (raft::Index)0);
+                if (b.contains("entries") && b["entries"].is_array()) {
+                    for (auto& e : b["entries"]) {
+                        raft::LogEntry le;
+                        le.term    = e.value("term",    (raft::Term)0);
+                        le.index   = e.value("index",   (raft::Index)0);
+                        le.payload = e.value("payload", std::string());
+                        a.entries.push_back(std::move(le));
+                    }
+                }
+                raft::AppendEntriesReply r;
+                raft_->handle_append_entries(a, &r);
+                ok(res, json{
+                    {"term",           r.term},
+                    {"success",        r.success},
+                    {"conflict_index", r.conflict_index},
+                    {"conflict_term",  r.conflict_term}
+                });
+            });
+
+        srv_.Get("/api/v1/cluster/raft/status",
+            [this](const httplib::Request&, httplib::Response& res) {
+                if (!raft_) {
+                    ok(res, json{{"enabled", false}});
+                    return;
+                }
+                ok(res, json{
+                    {"enabled",        true},
+                    {"role",           raft::role_name(raft_->role())},
+                    {"current_term",   raft_->current_term()},
+                    {"leader_id",      raft_->leader_id()},
+                    {"commit_index",   raft_->commit_index()},
+                    {"last_log_index", raft_->last_log_index()}
+                });
+            });
+
+        // POST /api/v1/cluster/raft/propose — convenience for tests / CLI.
+        // Body: {"payload": "<opaque string>"}. Only a leader accepts. On
+        // a follower returns 503 with the believed leader_id in the body.
+        srv_.Post("/api/v1/cluster/raft/propose",
+            [this, token_check](const httplib::Request& req, httplib::Response& res) {
+                if (!token_check(req, res)) return;
+                if (!raft_) { err(res, 503, "raft not configured"); return; }
+                json b = parse_body(req);
+                std::string payload = b.value("payload", std::string());
+                raft::Index idx = 0;
+                raft::NodeId hint;
+                bool ok_propose = raft_->propose(payload, &idx, &hint);
+                if (!ok_propose) {
+                    res.status = 503;
+                    res.set_content(json{
+                        {"code", 503},
+                        {"message", "not a leader"},
+                        {"data", json{{"leader_id", hint}}}
+                    }.dump(), "application/json");
+                    return;
+                }
+                ok(res, json{{"index", idx}});
+            });
     }
 };
 

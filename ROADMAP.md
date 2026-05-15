@@ -32,12 +32,17 @@ here so an operator can plan around them.
 - Snapshot bootstrap for new replicas (`/cluster/snapshot`)
 - Cluster-token gated control plane
 - Master `apply_replicated()` advances LSN atomically; restore reuses it
-- **Raft consensus core (in tree, not yet wired to writes)** — leader
-  election, log replication, §5.4.1 election restriction, §9.6 pre-vote,
-  pluggable `RaftTransport` / `RaftStateMachine` interfaces, file-backed
-  persistent state. Six-case unit suite in `test_raft`. The HTTP transport
-  binding and the leader-write hook into LSMTree are the next step
-  (Round 2 follow-up); manual `promote` remains the only failover today.
+- **Raft consensus core (in tree, HTTP transport live; not yet wired to
+  writes)** — leader election, log replication, §5.4.1 election
+  restriction, §9.6 pre-vote, parallel fan-out for RequestVote and
+  AppendEntries; pluggable `RaftTransport` / `RaftStateMachine`
+  interfaces; file-backed persistent state; HTTP-backed
+  `HttpRaftTransport` over `/api/v1/cluster/raft/{vote,append,status,propose}`
+  endpoints. Six-case in-memory unit suite (`test_raft`) plus a
+  loopback HTTP integration suite (`test_raft_http`) that drives three
+  real `HttpServer` instances through election, replication, and
+  leader failover. The leader-write hook into LSMTree is the last step
+  (Round 2 part 3); manual `promote` remains the only failover today.
 
 ### Auth / security
 - PBKDF2-HMAC-SHA256 (120,000 iterations) password hashing, PHC-prefixed
@@ -85,21 +90,33 @@ here so an operator can plan around them.
 ### Tier A · MUST (target: next 1–2 releases)
 
 #### A.1 Automatic failover
-**Status:** in progress. The full Raft state machine (leader election,
-log replication, §5.4.1 election restriction, §9.6 pre-vote) is in tree
-under `src/network/raft.{hpp,cpp}` with a thread-safe in-memory test
-harness exercising six scenarios (election, replication, leader failover,
-log catch-up, election restriction, pre-vote). What's still missing
-before the production switch:
-  * HTTP-backed `RaftTransport` over the existing `/cluster/*` endpoints.
+**Status:** in progress (Round 2 part 2 landed). The full Raft state
+machine and an HTTP-backed transport are in tree:
+  * `src/network/raft.{hpp,cpp}` — leader election, log replication,
+    §5.4.1 election restriction, §9.6 pre-vote, parallel fan-out for
+    RequestVote / AppendEntries
+  * `src/network/raft_http_transport.hpp` — JSON-over-HTTP transport
+    using the existing cluster_token for authentication
+  * `/api/v1/cluster/raft/{vote,append,status,propose}` HTTP endpoints
+    (registered alongside the legacy /cluster/changes streaming) — see
+    `setup_raft_routes()` in http_server.hpp
+  * Tests: `test_raft` (in-memory, six scenarios) + `test_raft_http`
+    (real HttpServer instances on three loopback ports, election +
+    propose + failover end-to-end). Both stress-checked at 30/30 and
+    10/10 consecutive runs.
+
+What's still missing before the production switch:
   * Leader write hook: replace the current `LSMTree::set_write_hook`
-    fan-out with `RaftNode::propose` + apply-into-LSM on commit.
+    fan-out with `RaftNode::propose` + apply-into-LSM on commit
+    (i.e. route every put/del through raft when a cluster is configured).
+  * `cluster_peers` / `node_id` config plumbing in `ServerConfig` so
+    operators can wire raft from the JSON config or CLI flags.
   * `InstallSnapshot` RPC + log compaction.
   * Joint-consensus membership change.
   * Multi-process integration tests + chaos suite.
 **Plan:** these land in the next release. The current manual
 `/cluster/promote` path stays usable until then.
-**Estimated effort remaining:** ~1.5 weeks engineering + 1 week chaos.
+**Estimated effort remaining:** ~1 week engineering + 1 week chaos.
 
 #### A.2 TLS termination in-process — *shipped (rev. May 2026)*
 **Status:** done. Build with `-DDELTA_TLS=ON`; pass `--tls-cert` /
