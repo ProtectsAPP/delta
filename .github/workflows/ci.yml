@@ -55,6 +55,48 @@ jobs:
         run: ctest --test-dir build --output-on-failure -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
   # ---------------------------------------------------------------------------
+  # TLS variant: build with -DDELTA_TLS=ON and run the full test suite,
+  # including the test_tls end-to-end check that drives a real SSLClient
+  # against an SSLServer.
+  # ---------------------------------------------------------------------------
+  build-and-test-tls:
+    name: build + ctest (TLS · ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev openssl
+
+      - name: install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja openssl@3
+
+      - name: configure (TLS on)
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cmake -S . -B build-tls -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                  -DDELTA_TLS=ON \
+                  -DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3
+          else
+            cmake -S . -B build-tls -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                  -DDELTA_TLS=ON
+          fi
+
+      - name: build
+        run: cmake --build build-tls --parallel
+
+      - name: ctest (TLS variant)
+        run: ctest --test-dir build-tls --output-on-failure -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+  # ---------------------------------------------------------------------------
   # build the Docker image so a broken Dockerfile is caught in CI, not in prod
   # ---------------------------------------------------------------------------
   docker-image:

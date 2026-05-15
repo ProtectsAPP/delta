@@ -15,6 +15,27 @@ endif()
 
 add_compile_options(-Wall -Wno-unused-parameter -Wno-unused-variable -Wno-sign-compare)
 
+# -----------------------------------------------------------------------------
+# DELTA_TLS — opt-in OpenSSL link for native TLS termination.
+#
+# When ON, cpp-httplib's SSLServer is enabled via CPPHTTPLIB_OPENSSL_SUPPORT,
+# OpenSSL is linked into delta_core, and HttpServer::enable_tls() becomes a
+# real method instead of returning false. Default is OFF so the standard
+# binary stays libssl-free for distros without OpenSSL dev headers.
+#
+# Build with TLS:
+#   cmake -S . -B build -DDELTA_TLS=ON
+#   cmake --build build -j8
+#
+# After build the binary serves HTTPS on the configured --tls-cert / --tls-key.
+# -----------------------------------------------------------------------------
+option(DELTA_TLS "Build with native TLS support (requires OpenSSL)" OFF)
+if(DELTA_TLS)
+  find_package(OpenSSL REQUIRED)
+  add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT=1)
+  message(STATUS "Delta: TLS enabled, linking OpenSSL ${OPENSSL_VERSION}")
+endif()
+
 include_directories(${CMAKE_SOURCE_DIR}/third_party ${CMAKE_SOURCE_DIR}/src)
 
 find_package(Threads REQUIRED)
@@ -32,6 +53,9 @@ file(GLOB_RECURSE DELTA_SOURCES
 
 add_library(delta_core STATIC ${DELTA_SOURCES})
 target_link_libraries(delta_core PUBLIC Threads::Threads)
+if(DELTA_TLS)
+  target_link_libraries(delta_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 add_executable(delta_server src/server/main.cpp src/server/config.cpp)
 target_link_libraries(delta_server PRIVATE delta_core)

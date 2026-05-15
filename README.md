@@ -156,6 +156,40 @@ ctest --test-dir build                   # unit tests
   --port 16888 --deltaql-port 16889 --ws-port 16890
 ```
 
+### Backend with TLS (HTTPS / wss://)
+
+The default binary is OpenSSL-free (smallest possible distribution).
+To terminate TLS in-process, build with `-DDELTA_TLS=ON`:
+
+```bash
+# Linux (apt)
+sudo apt-get install -y libssl-dev
+cmake -S . -B build-tls -DDELTA_TLS=ON
+cmake --build build-tls -j8
+
+# macOS (brew)
+brew install openssl@3
+cmake -S . -B build-tls -DDELTA_TLS=ON \
+      -DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3
+cmake --build build-tls -j8
+```
+
+Run with a cert + key:
+
+```bash
+# self-signed for development:
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout key.pem -out cert.pem -subj '/CN=localhost'
+
+./build-tls/delta_server --data ./data \
+  --tls-cert ./cert.pem --tls-key ./key.pem
+```
+
+`https://localhost:16888/api/v1/health` and `wss://localhost:16890/`
+are now native. Without `-DDELTA_TLS=ON` the same `--tls-cert`/`--tls-key`
+flags trigger a warn-and-fall-back to plain HTTP (compatible with the
+old "terminate at a reverse proxy" deployment).
+
 ### Admin console (Vue 3)
 
 ```bash

@@ -119,11 +119,56 @@ public:
                Tuning tuning = {},
                ReplicationManager* repl = nullptr)
         : store_(store), col_(col), cache_(cache), vec_(vec), auth_(auth),
-          sessions_(sessions), dbm_(dbm), pool_(pool), repl_(repl), tuning_(tuning) {
+          sessions_(sessions), dbm_(dbm), pool_(pool), repl_(repl),
+          srv_owned_(std::make_unique<httplib::Server>()),
+          srv_(*srv_owned_),
+          tuning_(tuning) {
         setup_routes();
         setup_cluster_routes();
         tune_for_high_concurrency();
+        initialized_ = true;
     }
+
+    // Static factory that builds an HttpServer with TLS already wired in.
+    // Only available when CPPHTTPLIB_OPENSSL_SUPPORT is defined; returns
+    // nullptr in non-TLS builds. Caller passes ownership-of-everything via
+    // raw pointers exactly like the regular constructor.
+    static std::unique_ptr<HttpServer> make_tls(
+            storage::LSMTree* store, CollectionEngine* col,
+            cache::CacheEngine* cache, vector::VectorEngine* vec,
+            auth::AuthManager* auth, auth::SessionManager* sessions,
+            database::DatabaseManager* dbm, ConnectionPool* pool,
+            const std::string& cert_path, const std::string& key_path,
+            Tuning tuning = {}, ReplicationManager* repl = nullptr) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        // Construct an SSLServer first; if it fails we bail before even
+        // creating the HttpServer, so we never have a half-initialized
+        // object floating around.
+        auto ssl = std::make_unique<httplib::SSLServer>(
+            cert_path.c_str(), key_path.c_str());
+        if (!ssl || !ssl->is_valid()) {
+            std::cerr << "[Delta][ERROR] TLS init failed (bad cert/key at "
+                      << cert_path << " / " << key_path << ")\n";
+            return nullptr;
+        }
+        // Use the private TLS-aware constructor.
+        auto hs = std::unique_ptr<HttpServer>(new HttpServer(
+            store, col, cache, vec, auth, sessions, dbm, pool,
+            std::move(ssl), tuning, repl));
+        hs->tls_enabled_ = true;
+        std::cout << "[Delta] TLS enabled (cert=" << cert_path << ")\n";
+        return hs;
+#else
+        (void)store; (void)col; (void)cache; (void)vec; (void)auth;
+        (void)sessions; (void)dbm; (void)pool;
+        (void)cert_path; (void)key_path; (void)tuning; (void)repl;
+        std::cerr << "[Delta][WARN] make_tls requested but binary built "
+                     "without DELTA_TLS=ON.\n";
+        return nullptr;
+#endif
+    }
+
+    bool tls_enabled() const { return tls_enabled_; }
 
     void listen(const std::string& host, int port) {
         std::cout << "[Delta] HTTP listening on " << host << ":" << port
@@ -150,6 +195,26 @@ public:
     uint64_t total_requests() const { return req_count_.load(std::memory_order_relaxed); }
 
 private:
+    // Private TLS-aware constructor used by make_tls(). Takes ownership of
+    // a pre-built SSLServer (already validated) and runs the same setup
+    // pipeline as the public constructor.
+    HttpServer(storage::LSMTree* store, CollectionEngine* col,
+               cache::CacheEngine* cache, vector::VectorEngine* vec,
+               auth::AuthManager* auth, auth::SessionManager* sessions,
+               database::DatabaseManager* dbm, ConnectionPool* pool,
+               std::unique_ptr<httplib::Server> ssl_server,
+               Tuning tuning, ReplicationManager* repl)
+        : store_(store), col_(col), cache_(cache), vec_(vec), auth_(auth),
+          sessions_(sessions), dbm_(dbm), pool_(pool), repl_(repl),
+          srv_owned_(std::move(ssl_server)),
+          srv_(*srv_owned_),
+          tuning_(tuning) {
+        setup_routes();
+        setup_cluster_routes();
+        tune_for_high_concurrency();
+        initialized_ = true;
+    }
+
     void tune_for_high_concurrency() {
         // cpp-httplib's threading model is one-thread-per-persistent-connection.
         // Therefore the worker pool must be at least as large as max concurrent
@@ -368,7 +433,19 @@ private:
     database::DatabaseManager* dbm_;
     ConnectionPool* pool_;
     ReplicationManager* repl_;
-    httplib::Server srv_;
+    // P2-2 (TLS): we keep a unique_ptr that owns either a plain
+    // httplib::Server or, when DELTA_TLS=ON and enable_tls() was called
+    // before listen(), an httplib::SSLServer. The reference srv_ binds to
+    // *srv_owned_ at construction and is NEVER rebound after that — so
+    // enable_tls() must swap the owned object BEFORE the constructor
+    // chain returns. We implement this by deferring setup_routes() /
+    // setup_cluster_routes() / tune_for_high_concurrency() into an
+    // initialize() helper called either from the ctor (plain HTTP) or
+    // from enable_tls()-then-initialize() (TLS), but never both.
+    std::unique_ptr<httplib::Server> srv_owned_;
+    httplib::Server& srv_;
+    bool tls_enabled_ = false;
+    bool initialized_ = false;
     uint64_t start_time_ = now_ms();
 
     static int http_status_for(int code) {

@@ -65,6 +65,10 @@ here so an operator can plan around them.
   `--backup-passphrase` or `backup_passphrase` in the JSON config
 - `delta-admin` CLI: `login | backup | restore | metrics | databases |
   users | audit-tail | slow-tail`
+- **Native TLS (opt-in)** — build with `-DDELTA_TLS=ON` to link OpenSSL
+  and serve HTTPS / `wss://` directly via cpp-httplib's SSLServer.
+  `--tls-cert` / `--tls-key` flags activate at startup. Default binary
+  stays libssl-free for distros without OpenSSL dev headers.
 - Single-binary Docker image, multi-arch GHCR releases
 - C++ integration test driving a real `HttpServer` over loopback
 
@@ -84,13 +88,12 @@ or a hand-rolled implementation, the metadata footprint is tiny) rather than
 inventing a custom protocol.
 **Estimated effort:** ~2 weeks engineering + 1 week chaos testing.
 
-#### A.2 TLS termination in-process
-**Status:** TLS-cert / TLS-key flags accepted but warn-and-ignored unless the
-binary is rebuilt with `CPPHTTPLIB_OPENSSL_SUPPORT=1`. The recommendation
-today is to terminate TLS at a reverse proxy (nginx, Envoy, ALB, Cloudflare).
-**Plan:** ship a second binary `delta_server_tls` linked against OpenSSL so
-the default distribution stays libssl-free, plus document the cert-rotation
-SIGHUP path.
+#### A.2 TLS termination in-process — *shipped (rev. May 2026)*
+**Status:** done. Build with `-DDELTA_TLS=ON`; pass `--tls-cert` /
+`--tls-key` at startup. cpp-httplib's `SSLServer` is used in place of the
+plain `Server`, and the `HttpServer` route registry is identical. Default
+build stays OpenSSL-free; the same flags on a non-TLS build warn and fall
+back to plain HTTP (so reverse-proxy deployments are unaffected).
 
 #### A.3 Data sharding
 **Status:** single-node store can hold whatever fits on one disk.

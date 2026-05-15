@@ -94,8 +94,32 @@ int main(int argc, char** argv) {
     network::HttpServer::Tuning ht{cfg.http_threads, cfg.keepalive_max_count,
                                     cfg.keepalive_timeout_sec, cfg.max_connections,
                                     cfg.slow_query_ms};
-    network::HttpServer server(store.get(), col.get(), cache.get(), vec.get(),
-                                auth.get(), sessions.get(), dbm.get(), pool.get(), ht, repl.get());
+
+    // P2-2 (TLS): when --tls-cert / --tls-key are configured AND the binary
+    // was built with -DDELTA_TLS=ON, build the HttpServer through the
+    // make_tls() factory so the underlying httplib::Server is an SSLServer.
+    // Otherwise fall back to the plain-HTTP constructor and warn if the user
+    // asked for TLS on a non-TLS build.
+    std::unique_ptr<network::HttpServer> server_owned;
+    if (!cfg.tls_cert.empty() && !cfg.tls_key.empty()) {
+        server_owned = network::HttpServer::make_tls(
+            store.get(), col.get(), cache.get(), vec.get(), auth.get(),
+            sessions.get(), dbm.get(), pool.get(),
+            cfg.tls_cert, cfg.tls_key, ht, repl.get());
+        if (!server_owned) {
+            std::cerr << "[Delta][WARN] TLS requested but could not start "
+                         "(bad cert/key, or binary built without "
+                         "-DDELTA_TLS=ON). Falling back to plain HTTP.\n";
+            Logger::instance().warn("tls_unavailable",
+                json{{"cert_set", true}, {"key_set", true}});
+        }
+    }
+    if (!server_owned) {
+        server_owned = std::make_unique<network::HttpServer>(
+            store.get(), col.get(), cache.get(), vec.get(), auth.get(),
+            sessions.get(), dbm.get(), pool.get(), ht, repl.get());
+    }
+    network::HttpServer& server = *server_owned;
 
     // Surface WS + DeltaQL traffic counters through HTTP /metrics. We capture
     // by reference into the singletons declared in their respective headers.
@@ -130,19 +154,12 @@ int main(int argc, char** argv) {
             json{{"per_sec", cfg.conn_rate_per_sec},
                  {"burst",   cfg.conn_rate_burst}});
     }
-    if (!cfg.tls_cert.empty() || !cfg.tls_key.empty()) {
-        // TLS termination requires building cpp-httplib with
-        // CPPHTTPLIB_OPENSSL_SUPPORT, which our default build does not enable
-        // (keeps the binary OpenSSL-free for distros without libssl). For
-        // production, terminate TLS at a reverse proxy (nginx, Envoy, ALB,
-        // Cloudflare). The config fields are accepted so an OpenSSL-enabled
-        // custom build can wire them in without further changes.
-        std::cerr << "[Delta][WARN] --tls-cert/--tls-key set but this build "
-                     "lacks OpenSSL support. Terminate TLS at a reverse proxy "
-                     "or rebuild with CPPHTTPLIB_OPENSSL_SUPPORT=1.\n";
-        Logger::instance().warn("tls_unavailable",
-            json{{"cert_set", !cfg.tls_cert.empty()},
-                 {"key_set",  !cfg.tls_key.empty()}});
+    // TLS wiring is handled at HttpServer construction time (above). When
+    // make_tls() succeeds, server.tls_enabled() == true and we serve HTTPS;
+    // otherwise we already logged the fallback to plain HTTP.
+    if (server.tls_enabled()) {
+        Logger::instance().info("tls_enabled",
+            json{{"cert", cfg.tls_cert}});
     }
 
     // P1-24: refuse to silently expose cluster admin endpoints with no token.
