@@ -32,6 +32,12 @@ here so an operator can plan around them.
 - Snapshot bootstrap for new replicas (`/cluster/snapshot`)
 - Cluster-token gated control plane
 - Master `apply_replicated()` advances LSN atomically; restore reuses it
+- **Raft consensus core (in tree, not yet wired to writes)** — leader
+  election, log replication, §5.4.1 election restriction, §9.6 pre-vote,
+  pluggable `RaftTransport` / `RaftStateMachine` interfaces, file-backed
+  persistent state. Six-case unit suite in `test_raft`. The HTTP transport
+  binding and the leader-write hook into LSMTree are the next step
+  (Round 2 follow-up); manual `promote` remains the only failover today.
 
 ### Auth / security
 - PBKDF2-HMAC-SHA256 (120,000 iterations) password hashing, PHC-prefixed
@@ -79,14 +85,21 @@ here so an operator can plan around them.
 ### Tier A · MUST (target: next 1–2 releases)
 
 #### A.1 Automatic failover
-**Status:** manual `promote` only.
-**Plan:** lightweight Raft-style leader election over the existing cluster
-token + heartbeat. The replication WAL is already idempotent (LSN-keyed), so
-the storage layer is ready; what's missing is consensus on *which* replica
-becomes the new master. Plan to integrate a small Raft library (e.g. NuRaft
-or a hand-rolled implementation, the metadata footprint is tiny) rather than
-inventing a custom protocol.
-**Estimated effort:** ~2 weeks engineering + 1 week chaos testing.
+**Status:** in progress. The full Raft state machine (leader election,
+log replication, §5.4.1 election restriction, §9.6 pre-vote) is in tree
+under `src/network/raft.{hpp,cpp}` with a thread-safe in-memory test
+harness exercising six scenarios (election, replication, leader failover,
+log catch-up, election restriction, pre-vote). What's still missing
+before the production switch:
+  * HTTP-backed `RaftTransport` over the existing `/cluster/*` endpoints.
+  * Leader write hook: replace the current `LSMTree::set_write_hook`
+    fan-out with `RaftNode::propose` + apply-into-LSM on commit.
+  * `InstallSnapshot` RPC + log compaction.
+  * Joint-consensus membership change.
+  * Multi-process integration tests + chaos suite.
+**Plan:** these land in the next release. The current manual
+`/cluster/promote` path stays usable until then.
+**Estimated effort remaining:** ~1.5 weeks engineering + 1 week chaos.
 
 #### A.2 TLS termination in-process — *shipped (rev. May 2026)*
 **Status:** done. Build with `-DDELTA_TLS=ON`; pass `--tls-cert` /
