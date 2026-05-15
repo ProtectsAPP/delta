@@ -14,6 +14,18 @@ here so an operator can plan around them.
 - Bloom-filtered SSTables (v2 with magic-number rejection of legacy files)
 - Crash-recovery replay via WAL on startup
 - Online compaction (background thread)
+- Multi-document ACID transactions: optimistic concurrency control, atomic
+  commit-or-rollback across collections, read-set version validation,
+  unique-index/version checks at commit time
+  (`POST /api/v1/transactions/execute`)
+
+### Query / indexing
+- Single-field equality + `$in` index plans
+- Composite (multi-field) index plans: equality on a leading prefix of
+  fields, with subsequent range/regex/etc. clauses correctly re-applied
+  on the candidate set
+- MongoDB-style aggregation pipeline:
+  `$match / $group / $sort / $limit / $skip / $project / $unwind / $lookup`
 
 ### Replication
 - Master / replica roles with WAL streaming (`/api/v1/cluster/*`)

@@ -1,6 +1,7 @@
 #pragma once
 #include "../core/common.hpp"
 #include "../core/collection.hpp"
+#include "../core/transaction.hpp"
 #include "../core/validation.hpp"
 #include "../core/logger.hpp"
 #include "../core/backup_crypto.hpp"
@@ -943,6 +944,100 @@ private:
             json b = parse_body(req);
             json result = col_->aggregate(db, sch, col_name, b.value("pipeline", json::array()));
             ok(res, result);
+        });
+
+        // -----------------------------------------------------------------
+        // Multi-document ACID transactions.
+        //
+        // POST /api/v1/transactions/execute
+        // Body: { "ops": [
+        //   {"op":"insert", "collection":"orders",   "doc": {...}, "ttl":0},
+        //   {"op":"update", "collection":"inventory","id":"x",
+        //                   "update": {"$inc":{"qty":-1}},
+        //                   "expected_version": 5},
+        //   {"op":"remove", "collection":"reserved", "id":"r1"}
+        // ] }
+        //
+        // Optional per-op `database` / `schema` override the session ones.
+        // The whole list runs as one transaction: validation runs first,
+        // then either every op is applied or none is. On conflict (read-set
+        // version mismatch, unique-index violation, etc.) the response is
+        // HTTP 409 with the failing op's index and the engine error.
+        // -----------------------------------------------------------------
+        srv_.Post(R"(/api/v1/transactions/execute)", [this](const httplib::Request& req, httplib::Response& res) {
+            auth::Session s; if (!require_auth(req, res, &s)) return;
+            json body = parse_body(req);
+            if (!body.is_object() || !body.contains("ops") || !body["ops"].is_array()) {
+                err(res, Status::INVALID, "body must contain ops array");
+                return;
+            }
+            const json& ops = body["ops"];
+            if (ops.empty()) {
+                ok(res, json{{"committed", true}, {"applied", 0}});
+                return;
+            }
+
+            // Permission pre-check: superuser bypasses, otherwise we need
+            // INSERT/UPDATE/DELETE on each (db,sch,col) referenced.
+            for (size_t i = 0; i < ops.size(); ++i) {
+                const json& o = ops[i];
+                if (!o.is_object() || !o.contains("op") || !o.contains("collection")) {
+                    err(res, Status::INVALID,
+                        "op[" + std::to_string(i) + "] missing op or collection");
+                    return;
+                }
+                std::string kind = o.value("op", std::string());
+                std::string db = o.value("database", s.database);
+                std::string sch = o.value("schema",   s.schema);
+                std::string col = o.value("collection", std::string());
+                uint32_t need = 0;
+                if      (kind == "insert") need = auth::PRIV_INSERT;
+                else if (kind == "update") need = auth::PRIV_UPDATE;
+                else if (kind == "remove") need = auth::PRIV_DELETE;
+                else {
+                    err(res, Status::INVALID,
+                        "op[" + std::to_string(i) + "] unknown kind: " + kind);
+                    return;
+                }
+                if (!require_perm(res, s, need, col_target(db, sch, col))) return;
+            }
+
+            auto tx = col_->begin_transaction();
+            for (size_t i = 0; i < ops.size(); ++i) {
+                const json& o = ops[i];
+                std::string kind = o.value("op", std::string());
+                std::string db = o.value("database", s.database);
+                std::string sch = o.value("schema",   s.schema);
+                std::string col = o.value("collection", std::string());
+                Status st;
+                if (kind == "insert") {
+                    json doc = o.value("doc", json::object());
+                    uint32_t ttl = o.value("ttl", 0u);
+                    std::string oid;
+                    st = tx.insert(db, sch, col, std::move(doc), oid, ttl);
+                } else if (kind == "update") {
+                    std::string id = o.value("id", std::string());
+                    json upd = o.value("update", json::object());
+                    uint64_t ev = o.value("expected_version", 0ull);
+                    st = tx.update(db, sch, col, id, upd, ev);
+                } else if (kind == "remove") {
+                    std::string id = o.value("id", std::string());
+                    st = tx.remove(db, sch, col, id);
+                }
+                if (!st.ok()) {
+                    err(res, st.code,
+                        "op[" + std::to_string(i) + "]: " + st.message);
+                    return;
+                }
+            }
+
+            auto cs = tx.commit();
+            if (!cs.ok()) {
+                int http_code = (cs.code == Status::CONFLICT) ? 409 : cs.code;
+                err(res, http_code, cs.message);
+                return;
+            }
+            ok(res, json{{"committed", true}, {"applied", ops.size()}});
         });
         srv_.Post(R"(/api/v1/collections/([^/]+)/count)", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;

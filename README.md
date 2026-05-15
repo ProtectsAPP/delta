@@ -105,7 +105,8 @@ Data: `/data` inside the container (== `~/.deltaql` for the in-container user).
 | **Documents** | Collection CRUD; nested-field queries (`address.city`); `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists/$regex/$contains`; `$and/$or/$nor`; sort; pagination; projection; bulk insert |
 | **Updates** | `$set / $unset / $inc / $mul / $push / $pull / $addToSet / $rename` |
 | **Aggregation** | `$match / $group / $sort / $limit / $skip / $project / $unwind / $lookup` with `$sum / $avg / $min / $max / $count` |
-| **Indexes** | B+ tree / hash / full-text / vector; unique constraints; auto-maintained |
+| **Transactions** | Multi-document ACID via `POST /transactions/execute`: optimistic concurrency control, atomic commit-or-rollback across collections, unique-index/version validation at commit |
+| **Indexes** | B+ tree / hash / full-text / vector; unique constraints; auto-maintained; composite (multi-field) indexes used for equality-prefix lookups in the query planner |
 | **Storage** | LSM-Tree (MemTable + SSTable + WAL); crash recovery |
 | **Cache** | String / Hash / List / Set / Sorted Set / Pub-Sub / TTL / LRU eviction / counters |
 | **Vectors** | HNSW with cosine / euclidean / dot distance; multiple indexes per collection; bulk insert |
@@ -188,6 +189,8 @@ GET|PATCH|DELETE /collections/{c}/documents/{id}
 POST /collections/{c}/documents/search       MongoDB-style filter
 POST /collections/{c}/aggregate              aggregation pipeline
 POST /collections/{c}/count
+
+POST /transactions/execute                   multi-document ACID transaction
 
 POST|DELETE /collections/{c}/vectors[/{id}]
 POST /collections/{c}/vectors/search

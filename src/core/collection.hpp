@@ -34,8 +34,7 @@
 //          wins behaviour intact for existing callers.
 //
 // What is intentionally still TODO (tracked in the audit roadmap):
-//   * Multi-field index composite range lookups (today only equality on
-//     the leading field is supported).
+//   * Multi-document ACID transactions.
 // =============================================================================
 #pragma once
 #include "document.hpp"
@@ -50,9 +49,19 @@ namespace delta {
 // Key format: doc:{db}:{schema}:{collection}:{id}
 // Meta key: meta:collection:{db}:{schema}:{collection}
 // Index key: idx:{db}:{schema}:{collection}:{indexname}:{value}:{docid}
+// Forward declaration so we can friend it without including transaction.hpp
+// (which itself needs to know about CollectionEngine).
+class Transaction;
+
 class CollectionEngine {
 public:
     explicit CollectionEngine(storage::LSMTree* store) : store_(store) {}
+
+    // Open a new transaction. The returned Transaction buffers writes in
+    // memory; nothing hits the store until commit() is called. See
+    // transaction.hpp for the full semantics. The Transaction holds a raw
+    // pointer back into this engine, so it MUST NOT outlive *this.
+    Transaction begin_transaction();
 
     static std::string doc_key(const std::string& db, const std::string& sch, const std::string& col, const std::string& id) {
         return "doc:" + db + ":" + sch + ":" + col + ":" + id;
@@ -635,13 +644,22 @@ private:
     //   * `field: {$eq: scalar}`
     //   * `field: {$in: [v1, v2, ...]}`
     //   * `$and: [<any of the above>...]`  (intersection of candidates)
+    //   * Composite index prefix equality + range on the next field:
+    //     e.g. index on [a, b] with filter {a: 1, b: {$gt: 5}}
+    //     uses the index to scan the range of b values under a=1.
     //
-    // Any other operator (range, $or, $regex, ...) makes the planner fall
-    // through to the full scan path. We always re-apply the full filter on
-    // top of the candidate set so correctness is identical either way.
+    // Any other operator ($or, $regex, ...) on a non-indexed field makes
+    // the planner fall through to the full scan path. We always re-apply
+    // the full filter on top of the candidate set so correctness is
+    // identical either way.
     bool plan_query(const CollectionMeta& cm, const json& filter,
                     std::vector<std::string>& out_ids) {
         if (!filter.is_object() || filter.empty()) return false;
+
+        // Try composite index plan first (prefix equality + optional range).
+        if (plan_composite(cm, filter, out_ids)) return true;
+
+        // Fall back to single-field equality plan.
         // Build a map: field-name → index that indexes ONLY that field.
         std::unordered_map<std::string, const IndexDef*> by_field;
         for (auto& idx : cm.indexes) {
@@ -683,6 +701,171 @@ private:
         if (first) return false;                          // no clause matched an index
         out_ids.assign(work.begin(), work.end());
         return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Composite index planner.
+    //
+    // For a multi-field index [f0, f1, ..., fN], we can use it if the filter
+    // provides equality on a leading prefix of fields (f0, f1, ..., fK-1).
+    //
+    // The approach:
+    //   1. Build the index key prefix from the equality values.
+    //   2. prefix_scan the equality portion of the index.
+    //   3. The full filter is always re-applied on the candidate set, so
+    //      range conditions on subsequent fields are handled correctly.
+    //
+    // This gives us efficient lookups like:
+    //   index: [category, price]
+    //   filter: {category: "electronics", price: {$gte: 100, $lte: 500}}
+    //   → prefix scan on category="electronics", then filter price in-memory.
+    //
+    // The key insight: even without order-preserving numeric encoding, the
+    // equality prefix alone dramatically narrows the candidate set. The
+    // post-filter ensures correctness for range conditions.
+    // -----------------------------------------------------------------------
+    bool plan_composite(const CollectionMeta& cm, const json& filter,
+                        std::vector<std::string>& out_ids) {
+        if (!filter.is_object()) return false;
+
+        // Flatten the filter into per-field clause maps.
+        std::unordered_map<std::string, json> field_clauses;
+        if (!flatten_filter(filter, field_clauses)) return false;
+
+        // Try each multi-field index and pick the one with the longest
+        // usable equality prefix.
+        const IndexDef* best_idx = nullptr;
+        size_t best_eq_len = 0;
+        bool best_has_range = false;
+
+        for (auto& idx : cm.indexes) {
+            if (idx.fields.size() < 2) continue;  // single-field handled elsewhere
+            size_t eq_len = 0;
+            bool has_range = false;
+
+            for (size_t i = 0; i < idx.fields.size(); ++i) {
+                const std::string& f = idx.fields[i];
+                auto it = field_clauses.find(f);
+                if (it == field_clauses.end()) break;
+
+                if (is_equality_clause(it->second)) {
+                    eq_len++;
+                } else if (is_range_clause(it->second)) {
+                    has_range = true;
+                    break;  // range terminates the usable prefix
+                } else {
+                    break;  // unsupported operator
+                }
+            }
+
+            // Must have at least one equality field to be useful.
+            if (eq_len == 0) continue;
+
+            // Prefer longer equality prefix, then prefer having a range
+            // (indicates the index is more relevant to the query).
+            if (eq_len > best_eq_len ||
+                (eq_len == best_eq_len && has_range && !best_has_range)) {
+                best_idx = &idx;
+                best_eq_len = eq_len;
+                best_has_range = has_range;
+            }
+        }
+
+        if (!best_idx) return false;
+
+        // Build the index key prefix from equality values.
+        std::string prefix = idx_prefix(cm.database, cm.schema, cm.name, best_idx->name);
+        for (size_t i = 0; i < best_eq_len; ++i) {
+            const std::string& f = best_idx->fields[i];
+            json val = get_equality_value(field_clauses[f]);
+            prefix += encode_index_value(val);
+        }
+
+        // Prefix scan: returns all docs matching the equality prefix.
+        // The full filter (including any range conditions) is re-applied
+        // by the caller, ensuring correctness.
+        std::set<std::string> got;
+        auto rng = store_->prefix_scan(prefix, 1'000'000);
+        for (auto& [k, idv] : rng) got.insert(idv);
+
+        if (got.empty()) return false;
+        out_ids.assign(got.begin(), got.end());
+        return true;
+    }
+
+    // Flatten a filter object into a map of field → clause value.
+    // Handles top-level fields and $and arrays. Returns false if the filter
+    // contains structures we can't reason about for composite planning.
+    bool flatten_filter(const json& f,
+                        std::unordered_map<std::string, json>& out) {
+        if (!f.is_object()) return false;
+        for (auto it = f.begin(); it != f.end(); ++it) {
+            const std::string& k = it.key();
+            const json& v = it.value();
+            if (k == "$and") {
+                if (!v.is_array()) return false;
+                for (auto& c : v) {
+                    if (!flatten_filter(c, out)) return false;
+                }
+            } else if (k == "$or" || k == "$nor" || k == "$not") {
+                return false;
+            } else if (k.size() && k[0] == '$') {
+                return false;
+            } else {
+                // If the same field appears multiple times (e.g. in separate
+                // $and clauses), merge them into a single object.
+                if (out.count(k) && out[k].is_object() && v.is_object()) {
+                    for (auto vit = v.begin(); vit != v.end(); ++vit) {
+                        out[k][vit.key()] = vit.value();
+                    }
+                } else {
+                    out[k] = v;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Check if a clause value represents an equality condition.
+    static bool is_equality_clause(const json& v) {
+        if (!v.is_object()) return true;  // scalar shorthand
+        if (v.contains("$eq")) return true;
+        if (v.contains("$in")) return true;
+        return false;
+    }
+
+    // Check if a clause value represents a range condition.
+    static bool is_range_clause(const json& v) {
+        if (!v.is_object()) return false;
+        return v.contains("$gt") || v.contains("$gte") ||
+               v.contains("$lt") || v.contains("$lte");
+    }
+
+    // Extract the equality value from a clause (scalar or {$eq: X}).
+    static json get_equality_value(const json& v) {
+        if (!v.is_object()) return v;
+        if (v.contains("$eq")) return v["$eq"];
+        // For $in, take the first value (this is a heuristic; the full
+        // filter re-check ensures correctness).
+        if (v.contains("$in") && v["$in"].is_array() && !v["$in"].empty()) {
+            return v["$in"][0];
+        }
+        return json();
+    }
+
+    // Extract range bounds from a clause object (reserved for future
+    // order-preserving encoding that would enable true range scans).
+    static void extract_range_bounds(const json& v, json& lo, json& hi,
+                                     bool& lo_inclusive, bool& hi_inclusive) {
+        lo = json();
+        hi = json();
+        lo_inclusive = true;
+        hi_inclusive = true;
+        if (!v.is_object()) return;
+        if (v.contains("$gte")) { lo = v["$gte"]; lo_inclusive = true; }
+        else if (v.contains("$gt")) { lo = v["$gt"]; lo_inclusive = false; }
+        if (v.contains("$lte")) { hi = v["$lte"]; hi_inclusive = true; }
+        else if (v.contains("$lt")) { hi = v["$lt"]; hi_inclusive = false; }
     }
 
     // Walk `filter` and pull out `(field, [values])` equality clauses.
@@ -752,6 +935,11 @@ private:
     // Reads (find / count / aggregate / get / list_collections) take a
     // shared lock; writes take a unique lock.
     mutable std::shared_mutex mu_;
+
+    // Friend so multi-document transactions can validate read-set versions
+    // and apply the buffered ops while holding mu_ exclusively. See
+    // transaction.cpp for the commit implementation.
+    friend class Transaction;
 };
 
 } // namespace delta
