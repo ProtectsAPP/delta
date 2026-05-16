@@ -1,0 +1,36 @@
+# Minimal Prometheus configuration for scraping a delta_server fleet.
+# See dashboards/README.md for the full provisioning walkthrough.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: "delta-prod"
+
+rule_files:
+  - "/etc/prometheus/alerts/delta.yml"
+
+scrape_configs:
+  - job_name: delta
+    metrics_path: /metrics
+    # delta serves /metrics unauthenticated by convention. Lock the port
+    # at the network layer (firewall / k8s NetworkPolicy) — never expose
+    # it to the public internet.
+    static_configs:
+      - targets:
+          # Adjust to your topology. For sharded deployments, list every
+          # node from every shard so the dashboard's `instance` selector
+          # shows them all.
+          - "delta-n1:16888"
+          - "delta-n2:16888"
+          - "delta-n3:16888"
+        labels:
+          # Optional: helps the alert runbook know which environment
+          # paged.
+          environment: "prod"
+
+# Optional Alertmanager wiring. Drop this in once you have an
+# Alertmanager instance routing to your paging tool of choice.
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]

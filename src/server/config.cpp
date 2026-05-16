@@ -81,6 +81,9 @@ ServerConfig ServerConfig::from_args(int argc, char** argv) {
         else if (a == "--shard")    c.shards.push_back(next());
         else if (a == "--shard-vnodes") c.shard_vnodes = safe_stoi(next(), c.shard_vnodes);
         else if (a == "--shard-rpc-timeout-ms") c.shard_rpc_timeout_ms = safe_stoi(next(), c.shard_rpc_timeout_ms);
+        // B.2 multi-master writes (active-active).
+        else if (a == "--mm-peer")    c.mm_peers.push_back(next());
+        else if (a == "--mm-poll-ms") c.mm_poll_ms = safe_stoi(next(), c.mm_poll_ms);
         else if (a == "--config") { c = from_file(next()); }
         else if (a == "--help" || a == "-h") {
             std::cout << "Delta Server\n"
@@ -126,6 +129,8 @@ ServerConfig ServerConfig::from_args(int argc, char** argv) {
                 "  --shard SPEC            repeatable; shard_id=id@host:port,id@host:port\n"
                 "  --shard-vnodes N        virtual nodes per shard (default 256, min 128)\n"
                 "  --shard-rpc-timeout-ms N  cross-shard call deadline (default 2500)\n"
+                "  --mm-peer URL           multi-master peer base URL (repeatable)\n"
+                "  --mm-poll-ms N          multi-master poll interval (default 500)\n"
                 "  --config FILE           Load JSON config\n";
             std::exit(0);
         }

@@ -94,4 +94,11 @@ if(Python3_Interpreter_FOUND)
             --binary $<TARGET_FILE:delta_server>
   )
   set_tests_properties(test_sharding_chaos PROPERTIES TIMEOUT 120)
+  add_test(
+    NAME test_multi_master_chaos
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tests/integration/multi_master_chaos.py
+            --binary $<TARGET_FILE:delta_server>
+  )
+  set_tests_properties(test_multi_master_chaos PROPERTIES TIMEOUT 120)
 endif()

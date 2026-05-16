@@ -40,6 +40,7 @@
 #include "document.hpp"
 #include "constants.hpp"
 #include "../storage/lsm_tree.hpp"
+#include "../cluster/hlc.hpp"
 #include <set>
 #include <shared_mutex>
 
@@ -56,6 +57,182 @@ class Transaction;
 class CollectionEngine {
 public:
     explicit CollectionEngine(storage::LSMTree* store) : store_(store) {}
+
+    // ----------- B.2 multi-master ----------------------------------------
+    // The engine owns a single HybridLogicalClock instance. Every multi-
+    // master write goes through `hlc_.tick()` to stamp the envelope, and
+    // every received remote change feeds `hlc_.update()` to keep the
+    // local clock ahead of incoming HLCs. Single-master collections are
+    // unaffected (the field is simply absent).
+    cluster::HybridLogicalClock& hlc() { return hlc_; }
+
+    // Apply a remote change under last-writer-wins semantics. `change`
+    // carries either a full envelope (insert/update) or a tombstone
+    // marker `{"_tombstone": true, "_id": ..., "_hlc": ...}`. The
+    // returned status reports whether we actually accepted it (Ok) or
+    // discarded as stale (already-applied / older HLC); both are
+    // success outcomes from the caller's perspective. Hard errors
+    // (corrupt JSON, missing collection) bubble up as non-Ok.
+    Status apply_remote_change(const std::string& db,
+                               const std::string& sch,
+                               const std::string& col,
+                               const json& change,
+                               bool* applied_out = nullptr) {
+        if (applied_out) *applied_out = false;
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        CollectionMeta m;
+        if (!get_collection_unlocked(db, sch, col, &m))
+            return Status::NotFound("collection not found");
+        if (!m.multi_master)
+            return Status::Invalid("collection is not multi_master");
+        if (!change.is_object() || !change.contains("_id"))
+            return Status::Invalid("change envelope missing _id");
+        std::string id = change["_id"].get<std::string>();
+        std::string remote_hlc = change.value("_hlc", std::string());
+        if (remote_hlc.empty())
+            return Status::Invalid("change envelope missing _hlc");
+        // Step the local clock forward so any subsequent local write
+        // gets an HLC strictly greater than the remote one.
+        try { hlc_.update(cluster::HybridLogicalClock::parse(remote_hlc)); }
+        catch (...) { return Status::Invalid("change has malformed _hlc"); }
+
+        std::string k = doc_key(db, sch, col, id);
+        std::string existing;
+        std::string local_hlc;
+        if (store_->get(k, &existing)) {
+            try {
+                json ex = json::parse(existing);
+                local_hlc = ex.value("_hlc", std::string());
+            } catch (...) {}
+        }
+        // Strict-greater LWW. Equal HLCs cannot collide between distinct
+        // nodes (the counter portion + node-relative tick guarantees
+        // global uniqueness once we add a per-node nonce — for v1 we
+        // resolve ties by lex order on the rendered string, which is
+        // stable across nodes).
+        if (!local_hlc.empty() && local_hlc >= remote_hlc) return Status::Ok();
+
+        bool is_tombstone = change.value("_tombstone", false);
+        if (is_tombstone) {
+            // Materialise the tombstone so the change shows up in
+            // subsequent pull-since responses to other peers. The
+            // tombstone envelope keeps `_hlc` for ordering and a
+            // `_deleted` marker for read-side filtering.
+            json env = {
+                {"_id",         id},
+                {"_hlc",        remote_hlc},
+                {"_tombstone",  true},
+                {"_deleted",    true},
+                {"updated_at",  now_ms()}
+            };
+            store_->put(k, env.dump());
+            // Drop secondary index entries pointing at the now-deleted
+            // doc so range/equality lookups don't surface ghosts.
+            if (!local_hlc.empty()) {
+                json prev_data;
+                try { prev_data = json::parse(existing).value("data", json()); } catch (...) {}
+                for (auto& idx : m.indexes) update_index(db, sch, col, idx, id, prev_data, json());
+            }
+            if (m.document_count > 0 && !local_hlc.empty()) {
+                // We only decrement when overwriting a non-tombstone.
+                bool was_live = false;
+                try { was_live = !json::parse(existing).value("_tombstone", false); } catch (...) {}
+                if (was_live) m.document_count--;
+            }
+            store_->put(meta_key(m.database, m.schema, m.name), m.to_json().dump());
+            if (applied_out) *applied_out = true;
+            return Status::Ok();
+        }
+        // Live document write. We accept whatever fields the remote
+        // sent verbatim (no field-level merge). Tombstones overwrite a
+        // live doc; live docs overwrite a tombstone.
+        json env = change;  // already includes _id, _hlc
+        if (!env.contains("data") && env.contains("doc")) env["data"] = env["doc"];
+        if (!env.contains("data")) {
+            // Allow envelopes that put the user payload at the top
+            // level (everything except meta keys).
+            json data = json::object();
+            for (auto it = env.begin(); it != env.end(); ++it) {
+                const std::string& k0 = it.key();
+                if (k0 == "_id" || k0 == "_hlc" || k0 == "_tombstone" ||
+                    k0 == "version" || k0 == "created_at" || k0 == "updated_at" ||
+                    k0 == "ttl" || k0 == "data") continue;
+                data[k0] = it.value();
+            }
+            json minimal = {
+                {"_id", id}, {"_hlc", remote_hlc}, {"data", data},
+                {"version", change.value("version", 1ull)},
+                {"created_at", change.value("created_at", now_ms())},
+                {"updated_at", change.value("updated_at", now_ms())},
+                {"ttl", change.value("ttl", 0u)}
+            };
+            env = minimal;
+        }
+        std::string serialized = env.dump();
+        if (serialized.size() > constants::COLLECTION_MAX_DOC_BYTES)
+            return Status::Invalid("document exceeds maximum size");
+        // Maintain secondary indexes with old-vs-new diff.
+        json prev_data = json();
+        bool prev_was_live = false;
+        if (!local_hlc.empty()) {
+            try {
+                json prev_env = json::parse(existing);
+                prev_was_live = !prev_env.value("_tombstone", false);
+                prev_data = prev_env.value("data", json());
+            } catch (...) {}
+        }
+        store_->put(k, serialized);
+        for (auto& idx : m.indexes) update_index(db, sch, col, idx, id, prev_data, env["data"]);
+        if (!prev_was_live) m.document_count++;
+        store_->put(meta_key(m.database, m.schema, m.name), m.to_json().dump());
+        if (applied_out) *applied_out = true;
+        return Status::Ok();
+    }
+
+    // Return every change in (db, sch, col) with `_hlc` strictly greater
+    // than `since_hlc`, bounded by `limit`. The result is sorted by HLC
+    // ascending so a peer can resume by max(_hlc) of the previous batch.
+    // Includes tombstones — they are part of the change set.
+    struct ChangeBatch {
+        std::vector<json> changes;     // each carries _id, _hlc, ...
+        std::string       max_hlc;     // empty if no rows returned
+    };
+    ChangeBatch pull_changes_since(const std::string& db,
+                                   const std::string& sch,
+                                   const std::string& col,
+                                   const std::string& since_hlc,
+                                   size_t limit = 1024) {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        ChangeBatch out;
+        CollectionMeta m;
+        if (!get_collection_unlocked(db, sch, col, &m)) return out;
+        if (!m.multi_master) return out;
+        // Full keyspace scan over `doc:{db}:{sch}:{col}:` is acceptable
+        // here because the puller is rate-limited (one peer-pull per
+        // poll interval). Future optimisation: maintain a secondary
+        // `hlcidx:` keyspace so this becomes a true O(batch) scan.
+        std::string prefix = doc_prefix(db, sch, col);
+        for (auto& [k, v] : store_->prefix_scan(prefix, 1000000)) {
+            (void)k;
+            try {
+                json env = json::parse(v);
+                std::string hlc_s = env.value("_hlc", std::string());
+                if (hlc_s.empty()) continue;       // single-master leftover
+                if (!since_hlc.empty() && hlc_s <= since_hlc) continue;
+                out.changes.push_back(env);
+            } catch (...) {}
+        }
+        std::sort(out.changes.begin(), out.changes.end(),
+                  [](const json& a, const json& b) {
+                      return a.value("_hlc", std::string())
+                           < b.value("_hlc", std::string());
+                  });
+        if (out.changes.size() > limit) out.changes.resize(limit);
+        if (!out.changes.empty())
+            out.max_hlc = out.changes.back().value("_hlc", std::string());
+        return out;
+    }
+    // -----------------------------------------------------------------
 
     // Open a new transaction. The returned Transaction buffers writes in
     // memory; nothing hits the store until commit() is called. See
@@ -132,7 +309,18 @@ public:
         if (id.empty()) { id = gen_id(); doc["_id"] = id; }
         std::string k = doc_key(db, sch, col, id);
         std::string existing;
-        if (store_->get(k, &existing)) return Status::Duplicate("document exists");
+        if (store_->get(k, &existing)) {
+            // For multi-master collections, an existing tombstone is the
+            // only legitimate way an insert can land on top of a
+            // populated key (delete-then-insert during sync convergence
+            // or reuse of an id). Reject anything else as Duplicate.
+            bool was_tombstone = false;
+            if (m.multi_master) {
+                try { was_tombstone = json::parse(existing).value("_tombstone", false); }
+                catch (...) {}
+            }
+            if (!was_tombstone) return Status::Duplicate("document exists");
+        }
         // Reject oversize docs before they reach the WAL framing layer.
         std::string serialized;
         // unique-index check uses the live document; serialize once after.
@@ -147,13 +335,28 @@ public:
             }
         }
         json envelope = {{"_id", id},{"data", doc},{"version", 1},{"created_at", now_ms()},{"updated_at", now_ms()},{"ttl", ttl}};
+        // B.2: stamp every multi-master write with an HLC so the
+        // bidirectional puller (and any peer it syncs with) can resolve
+        // last-writer-wins correctly across nodes.
+        if (m.multi_master) envelope["_hlc"] = hlc_.now_string();
         serialized = envelope.dump();
         if (serialized.size() > constants::COLLECTION_MAX_DOC_BYTES)
             return Status::Invalid("document exceeds maximum size");
+        // For multi-master collections, an existing tombstone for this id
+        // means a previous delete on this node — overwrite is fine, but
+        // we must not double-count document_count.
+        bool overwrites_tombstone = false;
+        if (m.multi_master) {
+            std::string prev;
+            if (store_->get(k, &prev)) {
+                try { overwrites_tombstone = json::parse(prev).value("_tombstone", false); }
+                catch (...) {}
+            }
+        }
         store_->put(k, serialized);
         // index insertions
         for (auto& idx : m.indexes) update_index(db, sch, col, idx, id, json(), doc);
-        m.document_count++;
+        if (!overwrites_tombstone) m.document_count++;
         // update_collection() takes the lock recursively otherwise; inline it.
         store_->put(meta_key(m.database, m.schema, m.name), m.to_json().dump());
         id_out = id;
@@ -166,6 +369,9 @@ public:
         if (!store_->get(doc_key(db, sch, col, id), &s)) return false;
         json env;
         try { env = json::parse(s); } catch (...) { return false; }
+        // B.2: tombstones are physically present so the puller can ship
+        // them, but reads must surface them as "not found".
+        if (env.value("_tombstone", false)) return false;
         // ttl check
         uint32_t ttl = env.value("ttl", 0u);
         uint64_t created = env.value("created_at", 0ull);
@@ -198,6 +404,9 @@ public:
         std::string s;
         if (!store_->get(doc_key(db, sch, col, id), &s)) return Status::NotFound("document not found");
         try { env = json::parse(s); } catch (...) { return Status::Invalid("corrupt document"); }
+        // B.2: a tombstone reads as "deleted" — refuse the update so the
+        // caller can re-create via insert if they really meant to.
+        if (env.value("_tombstone", false)) return Status::NotFound("document not found");
         {
             uint32_t ttl = env.value("ttl", 0u);
             uint64_t created = env.value("created_at", 0ull);
@@ -228,6 +437,7 @@ public:
         env["data"] = newd;
         env["version"] = env.value("version", 1ull) + 1;
         env["updated_at"] = now_ms();
+        if (m.multi_master) env["_hlc"] = hlc_.now_string();
         std::string serialized = env.dump();
         if (serialized.size() > constants::COLLECTION_MAX_DOC_BYTES)
             return Status::Invalid("document exceeds maximum size");
@@ -245,7 +455,24 @@ public:
         if (!store_->get(doc_key(db, sch, col, id), &s)) return Status::NotFound("document not found");
         json env;
         try { env = json::parse(s); } catch (...) { return Status::Invalid("corrupt document"); }
-        store_->del(doc_key(db, sch, col, id));
+        // Already-tombstoned: idempotent success on multi-master, NotFound otherwise.
+        if (env.value("_tombstone", false)) {
+            return m.multi_master ? Status::Ok() : Status::NotFound("document not found");
+        }
+        if (m.multi_master) {
+            // Replace the live envelope with a tombstone the puller will
+            // ship to peers. We keep `_hlc` so LWW resolves correctly.
+            json tomb = {
+                {"_id", id},
+                {"_hlc", hlc_.now_string()},
+                {"_tombstone", true},
+                {"_deleted", true},
+                {"updated_at", now_ms()}
+            };
+            store_->put(doc_key(db, sch, col, id), tomb.dump());
+        } else {
+            store_->del(doc_key(db, sch, col, id));
+        }
         for (auto& idx : m.indexes) update_index(db, sch, col, idx, id, env["data"], json());
         if (m.document_count > 0) m.document_count--;
         store_->put(meta_key(m.database, m.schema, m.name), m.to_json().dump());
@@ -271,6 +498,7 @@ public:
                 if (!store_->get(doc_key(db, sch, col, id), &s)) continue;
                 try {
                     json env = json::parse(s);
+                    if (env.value("_tombstone", false)) continue;  // B.2
                     uint32_t ttl = env.value("ttl", 0u);
                     uint64_t created = env.value("created_at", 0ull);
                     if (ttl > 0 && now_ms() > created + ttl * 1000ull) continue;
@@ -281,6 +509,7 @@ public:
         for (auto& [k, v] : store_->prefix_scan(doc_prefix(db, sch, col), 1000000)) {
             try {
                 json env = json::parse(v);
+                if (env.value("_tombstone", false)) continue;  // B.2
                 uint32_t ttl = env.value("ttl", 0u);
                 uint64_t created = env.value("created_at", 0ull);
                 if (ttl > 0 && now_ms() > created + ttl * 1000ull) continue;
@@ -340,6 +569,7 @@ public:
                 if (!store_->get(doc_key(db, sch, col, id), &s)) continue;
                 try {
                     json env = json::parse(s);
+                    if (env.value("_tombstone", false)) continue;  // B.2
                     if (FilterMatcher::match(env["data"], filter)) c++;
                 } catch (...) {}
             }
@@ -349,6 +579,7 @@ public:
         for (auto& [k, v] : store_->prefix_scan(doc_prefix(db, sch, col), 1000000)) {
             try {
                 json env = json::parse(v);
+                if (env.value("_tombstone", false)) continue;  // B.2
                 if (FilterMatcher::match(env["data"], filter)) c++;
             } catch(...) {}
         }
@@ -935,6 +1166,9 @@ private:
     // Reads (find / count / aggregate / get / list_collections) take a
     // shared lock; writes take a unique lock.
     mutable std::shared_mutex mu_;
+    // B.2: shared across all multi-master collections in this engine.
+    // Plain wall-clock-based ticks would lose causality across nodes.
+    cluster::HybridLogicalClock hlc_;
 
     // Friend so multi-document transactions can validate read-set versions
     // and apply the buffered ops while holding mu_ exclusively. See

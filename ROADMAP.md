@@ -167,17 +167,63 @@ shards (an unreachable shard surfaces as 503 to the client).
 
 ### Tier B · SHOULD (target: same quarter)
 
-#### B.1 Monitoring dashboard
-**Status:** `/metrics` is Prometheus-scrapable but no canonical Grafana JSON
-is shipped. Plan to add `dashboards/delta.json` plus alerting rules
-(`alerts/delta.yml`) covering: error-rate, p99 latency, cache hit rate,
-disk-space, replica lag, audit anomalies (failed-login rate spikes).
+#### B.1 Monitoring dashboard — *shipped (rev. May 2026)*
+**Status:** done. Three artefacts ship under `dashboards/` and `alerts/`:
 
-#### B.2 Multi-master writes (active-active)
-**Status:** master is single-writer.
-**Plan:** CRDT-encoded document model (LWW-register + add-wins set) for a
-subset of collection types. Existing collections stay single-master; the
-operator opts in per-collection at creation time.
+  * `dashboards/delta.json` — Grafana 9.x / 10.x dashboard JSON with
+    five rows (Overview, HTTP traffic & latency, Storage / cache /
+    vectors, WebSocket & DeltaQL traffic). Templated on `instance` so
+    it works for single-node and sharded fleets.
+  * `alerts/delta.yml` — Prometheus alerting rules covering
+    availability (`up == 0`, recent-restart), error rate (5xx/4xx
+    ratios), latency (p99 > 500ms warn, > 2s page), rate-limit spikes,
+    cache hit rate, SSTable backlog, connection-pool saturation, and
+    failed-login bursts.
+  * `dashboards/prometheus.example.yml` + `dashboards/README.md` —
+    drop-in scrape config and provisioning walkthrough.
+
+The default `delta_server` `/metrics` endpoint is unchanged
+(unauthenticated, Prometheus text format) so existing scrapers keep
+working.
+
+#### B.2 Multi-master writes (active-active) — *shipped (rev. May 2026)*
+**Status:** done. Per-collection opt-in via `multi_master:true` at
+collection-create time. The implementation:
+
+  * `src/cluster/hlc.hpp` — Hybrid Logical Clock (Kulkarni 2014)
+    encoded as a 16-character lexicographically sortable hex string.
+    Survives wall-clock skew + capture causality across nodes.
+  * `CollectionEngine::insert/update/remove` stamp `_hlc` on every
+    write to a multi-master collection. `remove` writes a tombstone
+    (kept around so the puller can ship it) instead of physically
+    deleting; tombstones are invisible to `get`/`find`/`count`.
+  * `CollectionEngine::apply_remote_change()` runs LWW conflict
+    resolution: strict-greater HLC wins; equal HLCs are stable across
+    nodes thanks to the rendered string ordering.
+  * `pull_changes_since(...)` returns every change with `_hlc` >
+    `since_hlc`, sorted ascending, capped at `limit`.
+  * Two HTTP endpoints behind the cluster token:
+    `POST /api/v1/cluster/mm/pull` and `.../mm/push`.
+    `GET /api/v1/cluster/mm/status` exposes per-peer cursors and
+    counters for the dashboard.
+  * Background puller (`HttpServer::start_mm_puller`) polls every
+    `--mm-peer URL` every `--mm-poll-ms` ms (default 500), advances
+    a per-collection cursor, and applies returned changes via
+    `apply_remote_change()`.
+  * Tests: `test_multi_master_chaos` walks 4 phases — disjoint
+    concurrent writes, same-id LWW races, delete-vs-update races,
+    and sync-status counters — all on a 2-node loopback cluster.
+
+Operators turn it on with:
+
+```bash
+delta_server --port 16888 --data /var/lib/delta/n1 \
+  --mm-peer http://n2:16888 --mm-peer http://n3:16888 \
+  --mm-poll-ms 500 --cluster-token <secret>
+```
+
+then create the collection with `{"multi_master": true}` in the body.
+Single-master collections stay unaffected.
 
 #### B.3 Cross-DC replication
 **Status:** replication assumes <1ms RTT between master and replica.

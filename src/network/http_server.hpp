@@ -1487,6 +1487,8 @@ private:
             m.database = b.value("database", s.database);
             m.schema = b.value("schema", s.schema);
             m.name = b.value("name", "");
+            // B.2: opt in to multi-master / HLC LWW for this collection.
+            m.multi_master = b.value("multi_master", false);
             if (m.name.empty()) { err(res, Status::INVALID, "name required"); return; }
             if (!require_perm(res, s, auth::PRIV_CREATE, {"database", m.database, "", ""})) return;
             if (b.contains("indexes")) for (auto& idx : b["indexes"]) m.indexes.push_back(IndexDef::from_json(idx));
@@ -2522,7 +2524,244 @@ private:
                 }
                 ok(res, json{{"index", idx}, {"peers", next}});
             });
+
+        // ---------- B.2 Multi-master writes (active-active) ----------
+        //
+        // Two endpoints:
+        //
+        //   POST /api/v1/cluster/mm/pull
+        //       body  { "database":"d", "schema":"s", "collection":"c",
+        //               "since_hlc":"<16-hex-string>", "limit": 1024 }
+        //       reply { "changes": [...], "max_hlc": "..." }
+        //
+        //   POST /api/v1/cluster/mm/push
+        //       body  { "database":"d", "schema":"s", "collection":"c",
+        //               "changes": [ {envelope-with-_hlc}, ... ] }
+        //       reply { "applied": N, "skipped": M }
+        //
+        // The endpoints are open to anyone holding the cluster token (so
+        // the bidirectional puller can use it as a service identity).
+        // Without a configured token the endpoints stay open for tests.
+        auto check_cluster_tok = [this](const httplib::Request& req,
+                                        httplib::Response& res) {
+            if (shard_token_.empty()) return true;  // open mode
+            if (req.get_header_value("X-Delta-Cluster-Token") == shard_token_) return true;
+            err(res, Status::UNAUTHORIZED, "cluster token required");
+            return false;
+        };
+        srv_.Post("/api/v1/cluster/mm/pull",
+            [this, check_cluster_tok](const httplib::Request& req, httplib::Response& res) {
+                if (!check_cluster_tok(req, res)) return;
+                json b = parse_body(req);
+                std::string db  = b.value("database",   std::string("default"));
+                std::string sch = b.value("schema",     std::string("public"));
+                std::string col = b.value("collection", std::string());
+                std::string since = b.value("since_hlc", std::string());
+                size_t limit = b.value("limit", (size_t)1024);
+                if (col.empty()) { err(res, Status::INVALID, "collection required"); return; }
+                auto batch = col_->pull_changes_since(db, sch, col, since, limit);
+                ok(res, json{
+                    {"changes", batch.changes},
+                    {"max_hlc", batch.max_hlc},
+                    {"count",   batch.changes.size()}
+                });
+            });
+        srv_.Post("/api/v1/cluster/mm/push",
+            [this, check_cluster_tok](const httplib::Request& req, httplib::Response& res) {
+                if (!check_cluster_tok(req, res)) return;
+                json b = parse_body(req);
+                std::string db  = b.value("database",   std::string("default"));
+                std::string sch = b.value("schema",     std::string("public"));
+                std::string col = b.value("collection", std::string());
+                if (col.empty()) { err(res, Status::INVALID, "collection required"); return; }
+                if (!b.contains("changes") || !b["changes"].is_array()) {
+                    err(res, Status::INVALID, "changes array required"); return;
+                }
+                int applied = 0, skipped = 0, failed = 0;
+                for (auto& ch : b["changes"]) {
+                    bool did = false;
+                    auto st = col_->apply_remote_change(db, sch, col, ch, &did);
+                    if (!st.ok()) failed++;
+                    else if (did) applied++;
+                    else skipped++;
+                }
+                mm_changes_pushed_in_.fetch_add(applied, std::memory_order_relaxed);
+                ok(res, json{
+                    {"applied", applied},
+                    {"skipped", skipped},
+                    {"failed",  failed}
+                });
+            });
+        srv_.Get("/api/v1/cluster/mm/status",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auth::Session s; if (!require_auth(req, res, &s)) return;
+                json peers = json::array();
+                {
+                    std::lock_guard<std::mutex> lk(mm_mu_);
+                    for (auto& [url, st] : mm_state_) {
+                        peers.push_back({
+                            {"peer_url",        url},
+                            {"last_pull_unix",  st.last_pull_ms / 1000},
+                            {"last_error",      st.last_error},
+                            {"changes_pulled",  st.changes_pulled.load()},
+                            {"per_collection",  st.cursor_json()}
+                        });
+                    }
+                }
+                ok(res, json{
+                    {"enabled",  mm_running_.load()},
+                    {"peers",    peers},
+                    {"pulled_total", mm_changes_pulled_.load()},
+                    {"pushed_in_total", mm_changes_pushed_in_.load()}
+                });
+            });
     }
+public:
+    // ----------- B.2 multi-master puller orchestration ----------------
+    // Public configuration: each `mm-peer` URL on the command line maps
+    // to one entry here. The puller thread polls every collection that
+    // is currently flagged `multi_master:true` and applies what comes
+    // back via apply_remote_change(). The pull cadence is fixed to 500ms
+    // for the first cut — operators can shrink it via --mm-poll-ms.
+    void set_mm_peers(const std::vector<std::string>& peers,
+                      const std::string& cluster_token,
+                      int poll_ms) {
+        mm_peers_     = peers;
+        if (!cluster_token.empty() && shard_token_.empty()) {
+            shard_token_ = cluster_token;
+        }
+        mm_poll_ms_   = std::max(50, poll_ms);
+        std::lock_guard<std::mutex> lk(mm_mu_);
+        mm_state_.clear();
+        for (auto& p : peers) mm_state_[p] = {};
+    }
+    void start_mm_puller() {
+        if (mm_peers_.empty()) return;
+        if (mm_running_.exchange(true)) return;  // already running
+        mm_thread_ = std::thread([this]() { mm_puller_loop(); });
+    }
+    void stop_mm_puller() {
+        if (!mm_running_.exchange(false)) return;
+        if (mm_thread_.joinable()) mm_thread_.join();
+    }
+private:
+    void mm_puller_loop() {
+        while (mm_running_.load()) {
+            // Sleep first so a fast-failure exit (e.g. start-up issue)
+            // doesn't hot-loop the network.
+            for (int slept = 0; slept < mm_poll_ms_; slept += 50) {
+                if (!mm_running_.load()) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            // Snapshot the multi-master collection set under shared
+            // lock so we don't hold mu_ during outbound HTTP.
+            std::vector<std::tuple<std::string, std::string, std::string>> mm_cols;
+            for (auto& cm : col_->list_collections("")) {
+                if (cm.multi_master)
+                    mm_cols.emplace_back(cm.database, cm.schema, cm.name);
+            }
+            for (auto& peer : mm_peers_) {
+                for (auto& [db, sch, col] : mm_cols) {
+                    mm_pull_one(peer, db, sch, col);
+                }
+            }
+        }
+    }
+    void mm_pull_one(const std::string& peer,
+                     const std::string& db, const std::string& sch,
+                     const std::string& col) {
+        std::string since;
+        {
+            std::lock_guard<std::mutex> lk(mm_mu_);
+            auto& st = mm_state_[peer];
+            since = st.cursors[db + ":" + sch + ":" + col];
+        }
+        httplib::Client cli(peer.c_str());
+        cli.set_connection_timeout(2, 0);
+        cli.set_read_timeout(5, 0);
+        cli.set_keep_alive(false);
+        httplib::Headers h;
+        if (!shard_token_.empty()) h.emplace("X-Delta-Cluster-Token", shard_token_);
+        json body = {
+            {"database", db}, {"schema", sch}, {"collection", col},
+            {"since_hlc", since}, {"limit", 1024}
+        };
+        auto rr = cli.Post("/api/v1/cluster/mm/pull", h, body.dump(), "application/json");
+        if (!rr) {
+            std::lock_guard<std::mutex> lk(mm_mu_);
+            mm_state_[peer].last_error = "pull connect: err=" + std::to_string((int)rr.error());
+            return;
+        }
+        if (rr->status != 200) {
+            std::lock_guard<std::mutex> lk(mm_mu_);
+            mm_state_[peer].last_error = "pull status=" + std::to_string(rr->status);
+            return;
+        }
+        json env;
+        try { env = json::parse(rr->body); }
+        catch (...) {
+            std::lock_guard<std::mutex> lk(mm_mu_);
+            mm_state_[peer].last_error = "pull parse"; return;
+        }
+        if (!env.contains("data")) return;
+        const json& d = env["data"];
+        std::string max_hlc = d.value("max_hlc", std::string());
+        if (!d.contains("changes") || !d["changes"].is_array()) return;
+        int applied = 0;
+        for (auto& ch : d["changes"]) {
+            bool did = false;
+            auto st = col_->apply_remote_change(db, sch, col, ch, &did);
+            if (st.ok() && did) applied++;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mm_mu_);
+            auto& st = mm_state_[peer];
+            st.last_pull_ms = now_ms();
+            st.last_error.clear();
+            st.changes_pulled.fetch_add(applied);
+            if (!max_hlc.empty()) {
+                st.cursors[db + ":" + sch + ":" + col] = max_hlc;
+            }
+        }
+        mm_changes_pulled_.fetch_add(applied, std::memory_order_relaxed);
+    }
+
+    struct MMPeerState {
+        // db:schema:collection -> last seen HLC.
+        std::map<std::string, std::string> cursors;
+        uint64_t                           last_pull_ms = 0;
+        std::string                        last_error;
+        std::atomic<uint64_t>              changes_pulled{0};
+
+        // Default ctor needed for std::map operator[].
+        MMPeerState() = default;
+        // The atomic makes the struct non-copyable; provide explicit
+        // copy semantics that are correct for our usage (we only read
+        // it under mm_mu_).
+        MMPeerState(const MMPeerState& o)
+            : cursors(o.cursors), last_pull_ms(o.last_pull_ms),
+              last_error(o.last_error),
+              changes_pulled(o.changes_pulled.load()) {}
+        MMPeerState& operator=(const MMPeerState& o) {
+            cursors = o.cursors; last_pull_ms = o.last_pull_ms;
+            last_error = o.last_error;
+            changes_pulled.store(o.changes_pulled.load());
+            return *this;
+        }
+        json cursor_json() const {
+            json o = json::object();
+            for (auto& [k, v] : cursors) o[k] = v;
+            return o;
+        }
+    };
+    std::vector<std::string> mm_peers_;
+    int                      mm_poll_ms_ = 500;
+    std::atomic<bool>        mm_running_{false};
+    std::thread              mm_thread_;
+    mutable std::mutex       mm_mu_;
+    std::map<std::string, MMPeerState> mm_state_;
+    std::atomic<uint64_t>    mm_changes_pulled_{0};
+    std::atomic<uint64_t>    mm_changes_pushed_in_{0};
 };
 
 } // namespace delta::network

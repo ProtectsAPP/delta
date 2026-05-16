@@ -255,6 +255,15 @@ GET  /llms.txt                                    (no auth — for AI agents)
 
 For every endpoint above, the request body is identical whether you send it over `deltaql://`, `ws://`, or `http://` — see `llms.txt` §5–§15.
 
+## Observability
+
+`delta_server` exposes Prometheus metrics on `GET /metrics`
+(unauthenticated, scrape it from inside your trust boundary). A
+ready-to-import Grafana dashboard and a set of Prometheus alerting
+rules ship under [`dashboards/`](./dashboards) and
+[`alerts/`](./alerts) respectively. Walkthrough in
+[`dashboards/README.md`](./dashboards/README.md).
+
 ## Default credentials
 
 | User | Password | Role |

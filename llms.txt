@@ -884,6 +884,73 @@ Re-balancing after a topology change: run
 It walks every collection, recomputes ownership under the new
 topology, and moves docs that landed on the wrong shard.
 
+### 14.4 · Multi-master writes (active-active)
+
+Per-collection opt-in. When a collection is created with
+`{"multi_master": true}`, every write to it gets stamped with a
+**hybrid logical clock** (`_hlc` field, 16-hex-char lexicographic) and
+deletes become tombstones instead of physical removes. A background
+puller pulls changes from each configured peer and merges them under
+last-writer-wins keyed on `_hlc`.
+
+Boot two active-active nodes (each writing to BOTH from real clients):
+
+```bash
+# n1
+delta_server --port 16888 --data /var/lib/delta/n1 \
+  --mm-peer http://n2:16888 \
+  --mm-poll-ms 500 \
+  --cluster-token <secret>
+
+# n2
+delta_server --port 16888 --data /var/lib/delta/n2 \
+  --mm-peer http://n1:16888 \
+  --mm-poll-ms 500 \
+  --cluster-token <secret>
+```
+
+Create the collection with the flag set on each node (no auto-broadcast
+in this orthogonal-to-sharding mode):
+
+```http
+POST /api/v1/collections
+Authorization: Bearer <tok>
+Content-Type: application/json
+
+{"name": "items", "multi_master": true}
+```
+
+After that, `POST /collections/items/documents` on either node
+converges to both within `--mm-poll-ms`. Concurrent writes to the same
+`_id` on different nodes resolve to the higher `_hlc`. Concurrent
+delete + update races resolve the same way.
+
+Endpoints:
+
+```
+POST /api/v1/cluster/mm/pull   (cluster-token gated)
+                               body: { "database", "schema",
+                                       "collection", "since_hlc",
+                                       "limit" }
+                               reply: { "changes": [...], "max_hlc" }
+POST /api/v1/cluster/mm/push   apply remote changes; reply
+                               { "applied", "skipped", "failed" }
+GET  /api/v1/cluster/mm/status authenticated; per-peer cursors and
+                               counters for monitoring
+```
+
+Caveats:
+
+  * Multi-master is **last-writer-wins per document**. There is no
+    field-level merge (no OR-set, no LWW-register-per-field). Apps
+    that need additive semantics should encode that themselves
+    (e.g. server-side `$inc` against a single-master collection).
+  * Tombstones are kept forever in this release; a future GC pass
+    will compact them once every peer has acknowledged.
+  * Multi-master is independent of sharding. Combining the two
+    means each shard runs its own active-active pair — workable
+    but not auto-configured by tooling yet.
+
 ---
 
 ## 15 · Complete REST endpoint index

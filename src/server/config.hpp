@@ -135,6 +135,15 @@ struct ServerConfig {
     // may have to follow a leader hint and retry once.
     int  shard_rpc_timeout_ms = 2500;
 
+    // -------------------------------------------------------------------------
+    // Multi-master (B.2). Each `mm_peer` is an http(s):// base URL of a
+    // peer that shares one or more `multi_master:true` collections. The
+    // background puller polls every peer every `mm_poll_ms` ms and applies
+    // returned changes via the engine's HLC-based LWW resolver.
+    // -------------------------------------------------------------------------
+    std::vector<std::string> mm_peers;
+    int                      mm_poll_ms = 500;
+
     // to_json() never includes cluster_token — it lands in startup logs.
     json to_json() const {
         return {
@@ -161,6 +170,8 @@ struct ServerConfig {
             {"shard_id", shard_id},
             {"shards", shards},
             {"shard_vnodes", shard_vnodes},
+            {"mm_peers", mm_peers},
+            {"mm_poll_ms", mm_poll_ms},
         };
     }
     static ServerConfig from_args(int argc, char** argv);

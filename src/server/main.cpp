@@ -315,6 +315,23 @@ int main(int argc, char** argv) {
                   << " vnodes=" << m.vnodes() << std::endl;
     }
 
+    // -------------------------------------------------------------------------
+    // B.2 Multi-master writes — the puller polls each peer and applies the
+    // returned changes via the engine's HLC-based LWW resolver. Independent
+    // of sharding: a single-shard or unsharded fleet can still run
+    // active-active by listing every node as `--mm-peer`. Operators are
+    // expected to designate `multi_master:true` per collection at create
+    // time.
+    // -------------------------------------------------------------------------
+    if (!cfg.mm_peers.empty()) {
+        server.set_mm_peers(cfg.mm_peers, cfg.cluster_token, cfg.mm_poll_ms);
+        Logger::instance().info("multi_master_enabled",
+            json{{"peer_count", (int)cfg.mm_peers.size()},
+                 {"poll_ms",    cfg.mm_poll_ms}});
+        std::cout << "[Delta] multi-master peers=" << cfg.mm_peers.size()
+                  << " poll_ms=" << cfg.mm_poll_ms << std::endl;
+    }
+
     std::signal(SIGINT, on_sig);
     std::signal(SIGTERM, on_sig);
 
@@ -326,6 +343,11 @@ int main(int argc, char** argv) {
     // wait until the HTTP server's accept loop is ready
     for (int i = 0; i < 50 && !server.is_running(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // Now that we're listening, kick off the multi-master background
+    // puller so peer convergence starts immediately. Stopped by a
+    // companion call after the listener returns.
+    if (!cfg.mm_peers.empty()) server.start_mm_puller();
 
     std::unique_ptr<network::DeltaQLServer>     dql;
     std::unique_ptr<network::ws::WebSocketServer> wss;
@@ -356,6 +378,7 @@ int main(int argc, char** argv) {
     if (raft_node) raft_node->stop();
     if (dql) dql->stop();
     if (wss) wss->stop();
+    server.stop_mm_puller();
     server.stop();
     if (http_thread.joinable()) http_thread.join();
     running = false;

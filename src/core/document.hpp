@@ -66,11 +66,18 @@ struct CollectionMeta {
     uint64_t created_at = 0;
     uint64_t document_count = 0;
     bool rls_enabled = false;
+    // Round 4 (B.2) — when true, every write to this collection stamps a
+    // hybrid logical clock (`_hlc`) into the document envelope, deletes
+    // become tombstones (kept around so the bidirectional puller can
+    // converge), and the multi-master sync handler treats incoming
+    // changes as last-writer-wins keyed on `_hlc`.
+    bool multi_master = false;
     json to_json() const {
         json arr = json::array();
         for (auto& i : indexes) arr.push_back(i.to_json());
         return {{"database",database},{"schema",schema},{"name",name},{"indexes",arr},
-                {"created_at",created_at},{"document_count",document_count},{"rls_enabled",rls_enabled}};
+                {"created_at",created_at},{"document_count",document_count},
+                {"rls_enabled",rls_enabled},{"multi_master",multi_master}};
     }
     static CollectionMeta from_json(const json& j) {
         CollectionMeta m;
@@ -80,6 +87,7 @@ struct CollectionMeta {
         m.created_at = j.value("created_at", 0ull);
         m.document_count = j.value("document_count", 0ull);
         m.rls_enabled = j.value("rls_enabled", false);
+        m.multi_master = j.value("multi_master", false);
         if (j.contains("indexes")) for (auto& x : j["indexes"]) m.indexes.push_back(IndexDef::from_json(x));
         return m;
     }

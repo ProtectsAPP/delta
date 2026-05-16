@@ -1,0 +1,210 @@
+# Prometheus alerting rules for delta_server.
+#
+# Drop this file into your Prometheus rule_files: glob (or load it via the
+# `kube-prometheus-stack` `additionalPrometheusRulesMap` value). The rules
+# expect the standard `instance` and `job` labels added automatically by
+# Prometheus's HTTP scraper.
+#
+# Severity convention:
+#   page     — wake somebody up
+#   warning  — visible on dashboard, ticket within business hours
+#   info     — purely informational, no notification routing required
+groups:
+  - name: delta.availability
+    interval: 30s
+    rules:
+      - alert: DeltaInstanceDown
+        # Prometheus marks an instance "up == 0" when scrape fails for
+        # `scrape_interval` worth of time. We require 2 minutes of failure
+        # to filter rolling restarts.
+        expr: up{job=~"delta.*"} == 0
+        for: 2m
+        labels:
+          severity: page
+          component: delta
+        annotations:
+          summary: "delta instance {{ $labels.instance }} is down"
+          description: |
+            {{ $labels.instance }} has been unreachable for >= 2 minutes
+            (job={{ $labels.job }}). Check the host, its disk, and the
+            delta_server stderr log.
+          runbook_url: "https://github.com/ProtectsAPP/delta/blob/main/ROADMAP.md#observability"
+
+      - alert: DeltaUptimeRecentRestart
+        expr: delta_uptime_seconds < 300
+        for: 1m
+        labels:
+          severity: info
+          component: delta
+        annotations:
+          summary: "delta instance {{ $labels.instance }} restarted recently"
+          description: |
+            Uptime is {{ $value | humanizeDuration }}. If this fires
+            repeatedly the process is crash-looping.
+
+  - name: delta.errors
+    interval: 30s
+    rules:
+      - alert: DeltaHigh5xxRate
+        # Server-side errors greater than 5% of total requests over 5 min.
+        expr: |
+          sum by (instance) (rate(delta_http_responses_total{class="5xx"}[5m]))
+            /
+          clamp_min(sum by (instance) (rate(delta_http_requests_total[5m])), 1e-9)
+            > 0.05
+        for: 5m
+        labels:
+          severity: page
+          component: delta
+        annotations:
+          summary: "{{ $labels.instance }} 5xx ratio over 5%"
+          description: |
+            {{ $value | humanizePercentage }} of requests in the last 5
+            minutes returned 5xx. Inspect the server log for stack traces
+            and check downstream dependencies (disk, replicas).
+
+      - alert: DeltaHigh4xxRate
+        # 4xx is mostly client noise, but a sustained spike usually means
+        # something rejected at auth/RLS or a misbehaving caller. We pick
+        # 30% over 10 min to filter normal usage.
+        expr: |
+          sum by (instance) (rate(delta_http_responses_total{class="4xx"}[10m]))
+            /
+          clamp_min(sum by (instance) (rate(delta_http_requests_total[10m])), 1e-9)
+            > 0.3
+        for: 10m
+        labels:
+          severity: warning
+          component: delta
+        annotations:
+          summary: "{{ $labels.instance }} 4xx ratio over 30%"
+          description: |
+            {{ $value | humanizePercentage }} client errors over 10 min —
+            check audit log for failed-login or permission-denied bursts.
+
+      - alert: DeltaRateLimitedSpike
+        expr: rate(delta_http_rate_limited_total[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: delta
+        annotations:
+          summary: "{{ $labels.instance }} is rate-limiting > 5 req/s"
+          description: |
+            The per-IP token bucket is rejecting more than 5 req/s. Either
+            tune --ip-rate-limit or investigate the offending client.
+
+  - name: delta.latency
+    interval: 30s
+    rules:
+      - alert: DeltaHighP99Latency
+        # p99 across all routes greater than 500ms for 10 minutes. The
+        # histogram resets across restarts, so the rate() will hold during
+        # rolling restarts.
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, instance) (rate(delta_http_request_duration_ms_bucket[5m]))
+          ) > 500
+        for: 10m
+        labels:
+          severity: warning
+          component: delta
+        annotations:
+          summary: "{{ $labels.instance }} p99 latency > 500ms"
+          description: |
+            p99 = {{ $value | humanize }} ms over 5m. Check disk I/O,
+            cache hit rate, and SSTable count (compaction backlog).
+
+      - alert: DeltaHighP99LatencyCritical
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, instance) (rate(delta_http_request_duration_ms_bucket[5m]))
+          ) > 2000
+        for: 5m
+        labels:
+          severity: page
+          component: delta
+        annotations:
+          summary: "{{ $labels.instance }} p99 latency > 2s"
+          description: |
+            p99 = {{ $value | humanize }} ms — likely a stalled compaction
+            or a runaway query. Inspect /api/v1/connections and slow-query
+            audit lines (channel="audit", msg="slow_query").
+
+  - name: delta.cache
+    interval: 1m
+    rules:
+      - alert: DeltaLowCacheHitRate
+        # Hit rate < 50% sustained for 30 min. Excludes new instances that
+        # have not yet warmed up by requiring at least 1 req/s.
+        expr: |
+          delta_cache_hit_rate < 0.5
+            and on(instance)
+          rate(delta_http_requests_total[10m]) > 1
+        for: 30m
+        labels:
+          severity: warning
+          component: delta
+        annotations:
+          summary: "{{ $labels.instance }} cache hit rate < 50%"
+          description: |
+            Cache hit rate is {{ $value | humanizePercentage }} over the
+            last 30 minutes. Consider raising --cache-max-bytes or
+            inspecting key patterns in /metrics for hot-key churn.
+
+  - name: delta.storage
+    interval: 1m
+    rules:
+      - alert: DeltaSSTableBacklog
+        # SSTable count over 200 means compaction is falling behind. The
+        # exact threshold scales with cardinality; tune per fleet.
+        expr: delta_storage_sstables > 200
+        for: 30m
+        labels:
+          severity: warning
+          component: delta
+        annotations:
+          summary: "{{ $labels.instance }} compaction backlog ({{ $value }} sstables)"
+          description: |
+            More than 200 SSTables for >= 30 min — compaction is not
+            keeping up. Check disk write throughput and consider
+            triggering a manual compaction.
+
+      - alert: DeltaConnectionPoolNearLimit
+        # 90% of declared http_threads worth of active connections.
+        expr: |
+          delta_connections_active
+            /
+          clamp_min(delta_http_threads, 1)
+            > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          component: delta
+        annotations:
+          summary: "{{ $labels.instance }} connection pool > 90% saturated"
+          description: |
+            Active connections / http_threads = {{ $value | humanizePercentage }}.
+            New requests will queue. Either raise --http-threads or
+            investigate slow handlers.
+
+  - name: delta.security
+    interval: 1m
+    rules:
+      - alert: DeltaFailedLoginBurst
+        # Surfaces brute-force attempts and stale-password bots. The
+        # delta_http_responses_total{class="4xx"} stream covers 401/403
+        # responses; finer-grained auth metrics live in the audit log.
+        expr: |
+          sum by (instance) (rate(delta_http_responses_total{class="4xx"}[5m])) > 20
+        for: 5m
+        labels:
+          severity: warning
+          component: delta-security
+        annotations:
+          summary: "{{ $labels.instance }} client-error burst (possible brute force)"
+          description: |
+            > 20 4xx/sec over 5 min. Cross-check the audit log
+            (channel="audit", msg="login_failed") for source IPs.
