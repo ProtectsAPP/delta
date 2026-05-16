@@ -62,6 +62,25 @@ ServerConfig ServerConfig::from_args(int argc, char** argv) {
         else if (a == "--tls-cert")   c.tls_cert = next();
         else if (a == "--tls-key")    c.tls_key  = next();
         else if (a == "--backup-passphrase") c.backup_passphrase = next();
+        else if (a == "--enable-raft") c.enable_raft = true;
+        else if (a == "--node-id") c.node_id = next();
+        else if (a == "--cluster-peer") {
+            // Repeatable. Comma-separated is also accepted, but the
+            // canonical form is one --cluster-peer per peer.
+            for (auto& p : split_csv(next())) c.cluster_peers.push_back(p);
+        }
+        else if (a == "--raft-election-min-ms") c.raft_election_min_ms = safe_stoi(next(), c.raft_election_min_ms);
+        else if (a == "--raft-election-max-ms") c.raft_election_max_ms = safe_stoi(next(), c.raft_election_max_ms);
+        else if (a == "--raft-heartbeat-ms")    c.raft_heartbeat_ms    = safe_stoi(next(), c.raft_heartbeat_ms);
+        else if (a == "--raft-tick-ms")         c.raft_tick_ms         = safe_stoi(next(), c.raft_tick_ms);
+        else if (a == "--raft-snapshot-threshold") c.raft_snapshot_threshold = safe_stoi(next(), c.raft_snapshot_threshold);
+        else if (a == "--raft-propose-timeout-ms") c.raft_propose_timeout_ms = safe_stoi(next(), c.raft_propose_timeout_ms);
+        else if (a == "--raft-no-pre-vote")     c.raft_pre_vote = false;
+        else if (a == "--enable-sharding") c.enable_sharding = true;
+        else if (a == "--shard-id") c.shard_id = next();
+        else if (a == "--shard")    c.shards.push_back(next());
+        else if (a == "--shard-vnodes") c.shard_vnodes = safe_stoi(next(), c.shard_vnodes);
+        else if (a == "--shard-rpc-timeout-ms") c.shard_rpc_timeout_ms = safe_stoi(next(), c.shard_rpc_timeout_ms);
         else if (a == "--config") { c = from_file(next()); }
         else if (a == "--help" || a == "-h") {
             std::cout << "Delta Server\n"
@@ -92,6 +111,21 @@ ServerConfig ServerConfig::from_args(int argc, char** argv) {
                 "  --tls-cert PATH         enable TLS with this PEM cert\n"
                 "  --tls-key  PATH         TLS private key (PEM)\n"
                 "  --backup-passphrase S   enable AES-256-GCM backup encryption\n"
+                "  --enable-raft           enable Raft consensus on the write path\n"
+                "  --node-id ID            unique node id within the cluster (e.g. n1)\n"
+                "  --cluster-peer SPEC     repeatable; format: id@host:port (include self)\n"
+                "  --raft-election-min-ms N\n"
+                "  --raft-election-max-ms N\n"
+                "  --raft-heartbeat-ms N\n"
+                "  --raft-tick-ms N\n"
+                "  --raft-snapshot-threshold N   committed entries before auto-snapshot\n"
+                "  --raft-propose-timeout-ms N   per-write commit deadline (default 5000)\n"
+                "  --raft-no-pre-vote      disable §9.6 pre-vote (debug only)\n"
+                "  --enable-sharding       enable consistent-hash sharding gateway\n"
+                "  --shard-id ID           this process' shard id (must appear in --shard)\n"
+                "  --shard SPEC            repeatable; shard_id=id@host:port,id@host:port\n"
+                "  --shard-vnodes N        virtual nodes per shard (default 256, min 128)\n"
+                "  --shard-rpc-timeout-ms N  cross-shard call deadline (default 2500)\n"
                 "  --config FILE           Load JSON config\n";
             std::exit(0);
         }
@@ -140,6 +174,25 @@ ServerConfig ServerConfig::from_file(const std::string& path) {
     c.tls_key               = j.value("tls_key",                c.tls_key);
     c.backup_passphrase     = j.value("backup_passphrase",      c.backup_passphrase);
 
+    c.enable_raft              = j.value("enable_raft",              c.enable_raft);
+    c.node_id                  = j.value("node_id",                  c.node_id);
+    if (j.contains("cluster_peers") && j["cluster_peers"].is_array())
+        c.cluster_peers = j["cluster_peers"].get<std::vector<std::string>>();
+    c.raft_election_min_ms     = j.value("raft_election_min_ms",     c.raft_election_min_ms);
+    c.raft_election_max_ms     = j.value("raft_election_max_ms",     c.raft_election_max_ms);
+    c.raft_heartbeat_ms        = j.value("raft_heartbeat_ms",        c.raft_heartbeat_ms);
+    c.raft_tick_ms             = j.value("raft_tick_ms",             c.raft_tick_ms);
+    c.raft_pre_vote            = j.value("raft_pre_vote",            c.raft_pre_vote);
+    c.raft_snapshot_threshold  = j.value("raft_snapshot_threshold",  c.raft_snapshot_threshold);
+    c.raft_propose_timeout_ms  = j.value("raft_propose_timeout_ms",  c.raft_propose_timeout_ms);
+
+    c.enable_sharding          = j.value("enable_sharding",          c.enable_sharding);
+    c.shard_id                 = j.value("shard_id",                 c.shard_id);
+    if (j.contains("shards") && j["shards"].is_array())
+        c.shards = j["shards"].get<std::vector<std::string>>();
+    c.shard_vnodes             = j.value("shard_vnodes",             c.shard_vnodes);
+    c.shard_rpc_timeout_ms     = j.value("shard_rpc_timeout_ms",     c.shard_rpc_timeout_ms);
+
     if (j.contains("cors") && j["cors"].is_object()) {
         const auto& co = j["cors"];
         if (co.contains("allowed_origins") && co["allowed_origins"].is_array())
@@ -152,4 +205,32 @@ ServerConfig ServerConfig::from_file(const std::string& path) {
     }
     return c;
 }
+
+// Parse "id@host:port". Returns an empty-id PeerSpec when the format is
+// invalid; the caller is expected to detect and warn. Whitespace is trimmed
+// on the boundary characters so "n1 @ 127.0.0.1:16888" still works.
+ServerConfig::PeerSpec ServerConfig::parse_peer_spec(const std::string& raw) {
+    PeerSpec p;
+    std::string s = raw;
+    // trim
+    auto l = s.find_first_not_of(" \t");
+    auto r = s.find_last_not_of(" \t");
+    if (l == std::string::npos) return p;
+    s = s.substr(l, r - l + 1);
+
+    auto at = s.find('@');
+    if (at == std::string::npos) return p;
+    auto colon = s.rfind(':');
+    if (colon == std::string::npos || colon <= at + 1) return p;
+
+    p.id   = s.substr(0, at);
+    p.host = s.substr(at + 1, colon - at - 1);
+    try { p.port = std::stoi(s.substr(colon + 1)); }
+    catch (...) { p.port = 0; }
+    if (p.id.empty() || p.host.empty() || p.port <= 0 || p.port > 65535) {
+        p = PeerSpec{};  // mark invalid
+    }
+    return p;
+}
+
 }

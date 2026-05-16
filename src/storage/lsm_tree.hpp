@@ -505,6 +505,28 @@ public:
     void set_write_hook(WriteHook hook) { hook_ = std::move(hook); }
     uint64_t current_lsn() const { return next_lsn_.load(std::memory_order_relaxed); }
 
+    // -------------------------------------------------------------------------
+    // Raft write-path hook (Round 2 part 3).
+    //
+    // When `set_raft_proposer(p)` is installed with a non-null callable,
+    // every put/del short-circuits the local WAL/memtable path: the call
+    // serialises (key, value, tomb) through `p` and `p` is expected to (1)
+    // propose the entry through raft, (2) wait for it to commit AND apply
+    // on the local node (via apply_replicated, called from raft's state
+    // machine), and (3) return true. A false return MUST cause put/del to
+    // throw a std::runtime_error("raft: not leader") so the HTTP layer can
+    // surface the failure as a 503/500 to the client.
+    //
+    // While the proposer is installed, the legacy WriteHook is bypassed —
+    // the master/replica streaming and the raft streaming are mutually
+    // exclusive write paths.
+    // -------------------------------------------------------------------------
+    using RaftProposer = std::function<bool(const std::string& key,
+                                            const std::string& value,
+                                            bool tombstone)>;
+    void set_raft_proposer(RaftProposer p) { raft_proposer_ = std::move(p); }
+    bool raft_active() const { return static_cast<bool>(raft_proposer_); }
+
     // Replicas call this. Bypasses the local hook so the record isn't
     // re-broadcast in a loop.
     void apply_replicated(uint64_t lsn, const std::string& key,
@@ -520,6 +542,15 @@ public:
     }
 
     void put(const std::string& key, const std::string& value) {
+        // Raft cutover (Round 2 part 3): every leader-side write goes
+        // through the proposer; the actual local store mutation will
+        // happen via apply_replicated() once raft commits.
+        if (raft_proposer_) {
+            if (!raft_proposer_(key, value, false)) {
+                throw std::runtime_error("raft: not leader");
+            }
+            return;
+        }
         std::lock_guard<std::mutex> wlk(write_mu_);   // P0-3
         uint64_t lsn = next_lsn_.fetch_add(1, std::memory_order_relaxed) + 1;
         wal_->append(key, value, false);
@@ -530,6 +561,12 @@ public:
     }
 
     void del(const std::string& key) {
+        if (raft_proposer_) {
+            if (!raft_proposer_(key, std::string(), true)) {
+                throw std::runtime_error("raft: not leader");
+            }
+            return;
+        }
         std::lock_guard<std::mutex> wlk(write_mu_);   // P0-3
         uint64_t lsn = next_lsn_.fetch_add(1, std::memory_order_relaxed) + 1;
         wal_->append(key, "", true);
@@ -854,6 +891,7 @@ private:
 
     std::atomic<uint64_t>                             next_lsn_{0};
     WriteHook                                         hook_;
+    RaftProposer                                      raft_proposer_;
 };
 
 } // namespace delta::storage

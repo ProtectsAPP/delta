@@ -151,6 +151,13 @@ class DeltaClient {
   clusterInfo() { return this.request('GET', '/cluster/info'); }
   promote() { return this.request('POST', '/cluster/promote'); }
   demote(masterUrl: string) { return this.request('POST', '/cluster/demote', { master_url: masterUrl }); }
+
+  // Sharding (Round 3)
+  shardInfo() { return this.request('GET', '/cluster/shards'); }
+  shardRoute(key: string) {
+    return this.request('GET',
+      `/cluster/shards/route?key=${encodeURIComponent(key)}`);
+  }
 }
 
 export const delta = new DeltaClient();

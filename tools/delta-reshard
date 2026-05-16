@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""delta-reshard — rebalance Delta documents after a topology change.
+
+Use case
+--------
+When you add or remove a shard, the consistent-hash ring shifts and a fraction
+(~1/N) of existing documents now hash to a different shard than the one that
+stores them. Until they're moved, point reads still work (the gateway forwards
+to the OLD owner via the OLD topology) but only if you keep that old
+topology loaded; once you cut over to the new --shard list every node has
+docs that "belong" elsewhere.
+
+`delta-reshard` walks every collection on every shard, recomputes the target
+shard for each document under the NEW topology, and moves the doc:
+
+    1. POST   the doc to the gateway (any node will do; the gateway routes
+       to the new owner).
+    2. DELETE the doc from its CURRENT shard via a direct call (bypasses the
+       gateway so we don't recursively talk to the new owner).
+
+Run modes
+---------
+    --dry-run                 just report which docs would move
+    --collection <name>       restrict to one collection
+    --schema <s> --database <d>
+    --chunk-size N            commit-per-N (default 200) — bounds memory
+    --parallel N              concurrent moves (default 4)
+
+Required flags
+--------------
+    --gateway URL             base URL of ANY node (it'll forward as needed)
+    --user / --password       admin login on each shard's HTTP API
+    --shard URL_1 URL_2 ...   direct-access URL of EVERY shard (one URL per
+                              shard; the tool reads from each in turn)
+
+Exit code 0 = all targeted docs are now in the right place. 1 = at least one
+move failed; rerun to retry.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def http(method, url, body=None, headers=None, timeout=10.0):
+    h = {"Content-Type": "application/json"}
+    if headers: h.update(headers)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers=h)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try: return e.code, json.loads(e.read().decode())
+        except Exception: return e.code, None
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+        return 0, {"err": str(e)}
+
+
+def login(base_url, user, pw):
+    code, body = http("POST", f"{base_url}/api/v1/auth/login",
+                      {"username": user, "password": pw})
+    if code != 200 or not body or "data" not in body: return None
+    return body["data"]["token"]
+
+
+def get_topology(base_url, tok):
+    code, body = http("GET", f"{base_url}/api/v1/cluster/shards",
+                      headers={"Authorization": f"Bearer {tok}"})
+    if code != 200 or not body or not body.get("data", {}).get("enabled"):
+        return None
+    return body["data"]
+
+
+def list_collections(base_url, tok):
+    """Return [(db, schema, name), ...]."""
+    out = []
+    code, body = http("GET", f"{base_url}/api/v1/databases",
+                      headers={"Authorization": f"Bearer {tok}"})
+    if code != 200: return out
+    dbs = (body.get("data") or {}).get("databases", []) if body else []
+    for db in dbs:
+        db_name = db.get("name", "default") if isinstance(db, dict) else db
+        c2, b2 = http("GET",
+            f"{base_url}/api/v1/databases/{db_name}/schemas",
+            headers={"Authorization": f"Bearer {tok}"})
+        schemas = (b2.get("data") or {}).get("schemas", []) if b2 else []
+        # Many deployments only use the default schema "public".
+        if not schemas: schemas = [{"name": ""}]
+        for s in schemas:
+            sch = s.get("name", "") if isinstance(s, dict) else s
+            c3, b3 = http(
+                "GET",
+                f"{base_url}/api/v1/collections"
+                f"?database={db_name}&schema={sch}",
+                headers={"Authorization": f"Bearer {tok}"})
+            colls = (b3.get("data") or {}).get("collections", []) if b3 else []
+            for c in colls:
+                name = c.get("name", "") if isinstance(c, dict) else c
+                if name: out.append((db_name, sch, name))
+    return out
+
+
+def scan_all_docs(base_url, tok, db, sch, col, chunk_size):
+    """Yield every doc in the given collection on the given shard."""
+    skip = 0
+    while True:
+        code, body = http("POST",
+            f"{base_url}/api/v1/collections/{col}/documents/search"
+            f"?database={db}&schema={sch}",
+            {"filter": {}, "skip": skip, "limit": chunk_size},
+            headers={"Authorization": f"Bearer {tok}",
+                     # CRITICAL: scan the LOCAL shard only, not the fan-out.
+                     "X-Delta-Shard-Hop": "reshard"})
+        docs = (body.get("data") or {}).get("documents", []) if body else []
+        if not docs: return
+        for d in docs: yield d
+        if len(docs) < chunk_size: return
+        skip += len(docs)
+
+
+def reshard(args):
+    gateway_tok = login(args.gateway, args.user, args.password)
+    if not gateway_tok:
+        print(f"FAIL: cannot login at gateway {args.gateway}", file=sys.stderr)
+        return 1
+    topo = get_topology(args.gateway, gateway_tok)
+    if not topo:
+        print("FAIL: gateway is not running with --enable-sharding",
+              file=sys.stderr)
+        return 1
+    print(f"[reshard] topology: {topo['shard_count']} shards, "
+          f"vnodes={topo['vnodes']}")
+
+    # Login on each shard (URLs map 1:1 to shards in topology order; the
+    # operator supplies one URL per shard with --shard).
+    if len(args.shard) != topo["shard_count"]:
+        print(f"FAIL: --shard count {len(args.shard)} != topology "
+              f"shard_count {topo['shard_count']}", file=sys.stderr)
+        return 1
+    shard_toks = {}
+    for url in args.shard:
+        t = login(url, args.user, args.password)
+        if not t:
+            print(f"FAIL: cannot login at shard {url}", file=sys.stderr)
+            return 1
+        shard_toks[url] = t
+
+    moved = stayed = failed = 0
+    for shard_url in args.shard:
+        tok = shard_toks[shard_url]
+        cols = list_collections(shard_url, tok)
+        # Optional filtering.
+        if args.collection:
+            cols = [c for c in cols if c[2] == args.collection]
+        if args.database:
+            cols = [c for c in cols if c[0] == args.database]
+        if args.schema:
+            cols = [c for c in cols if c[1] == args.schema]
+        for (db, sch, col) in cols:
+            print(f"[reshard] scanning {shard_url} :: {db}/{sch}/{col}")
+
+            def move(doc):
+                nonlocal moved, stayed, failed
+                doc_id = doc.get("_id")
+                if not doc_id:
+                    return  # legacy doc without id; can't move
+                # Recompute shard via the gateway's route endpoint (it
+                # uses the NEW topology by definition).
+                code, body = http(
+                    "GET",
+                    f"{args.gateway}/api/v1/cluster/shards/route"
+                    f"?key={doc_id}",
+                    headers={"Authorization": f"Bearer {gateway_tok}"})
+                if code != 200 or not body: return
+                target = body["data"]["shard_id"]
+                # Is the doc already on the right shard? Compare against
+                # this shard's id (look up in topo by URL: the operator
+                # supplied --shard URLs in the same order as topology).
+                # We use the local /cluster/shards to confirm.
+                lcode, lbody = http(
+                    "GET", f"{shard_url}/api/v1/cluster/shards",
+                    headers={"Authorization": f"Bearer {tok}"})
+                local_id = ((lbody or {}).get("data") or {}).get(
+                    "local_shard", "")
+                if local_id == target:
+                    stayed += 1
+                    return
+                if args.dry_run:
+                    moved += 1
+                    print(f"  would move {doc_id} {local_id} -> {target}")
+                    return
+                # Write to gateway (routes to the new owner).
+                wcode, _ = http(
+                    "POST",
+                    f"{args.gateway}/api/v1/collections/{col}/documents"
+                    f"?database={db}&schema={sch}",
+                    doc,
+                    headers={"Authorization": f"Bearer {gateway_tok}"})
+                if wcode != 200:
+                    failed += 1
+                    return
+                # Delete from current owner (direct, no gateway hop).
+                dcode, _ = http(
+                    "DELETE",
+                    f"{shard_url}/api/v1/collections/{col}/"
+                    f"documents/{doc_id}?database={db}&schema={sch}",
+                    headers={"Authorization": f"Bearer {tok}",
+                             "X-Delta-Shard-Hop": "reshard"})
+                if dcode != 200:
+                    failed += 1
+                    return
+                moved += 1
+
+            with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+                futs = []
+                for d in scan_all_docs(shard_url, tok, db, sch, col,
+                                        args.chunk_size):
+                    futs.append(pool.submit(move, d))
+                for f in as_completed(futs): f.result()
+
+    print(f"[reshard] done: moved={moved} stayed={stayed} failed={failed}")
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gateway", required=True,
+                    help="any node's base URL (e.g. http://host:16888)")
+    ap.add_argument("--shard", action="append", required=True,
+                    help="one base URL per shard (repeatable, "
+                         "same order as the topology shards array)")
+    ap.add_argument("--user", default="admin")
+    ap.add_argument("--password", default="admin")
+    ap.add_argument("--collection")
+    ap.add_argument("--schema")
+    ap.add_argument("--database")
+    ap.add_argument("--chunk-size", type=int, default=200)
+    ap.add_argument("--parallel", type=int, default=4)
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    sys.exit(reshard(args))

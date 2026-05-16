@@ -50,12 +50,35 @@ public:
         return true;
     }
 
+    bool send_install_snapshot(const NodeId& peer, const InstallSnapshotArgs& args,
+                               InstallSnapshotReply* reply) override {
+        json body = {
+            {"term",                args.term},
+            {"leader_id",           args.leader_id},
+            {"last_included_index", args.last_included_index},
+            {"last_included_term",  args.last_included_term},
+            {"data",                args.data},
+            {"peers",               args.peers},
+        };
+        json out;
+        // Snapshots can be large; per-call timeout is ten times the
+        // default heartbeat budget. The election/heartbeat path keeps
+        // rpc_timeout_ms_ unchanged so concurrent peer calls are
+        // unaffected.
+        int snap_timeout = std::max(rpc_timeout_ms_ * 10, 5000);
+        if (!post(peer, "/api/v1/cluster/raft/install_snapshot", body, &out,
+                  snap_timeout)) return false;
+        reply->term = out.value("term", (Term)0);
+        return true;
+    }
+
     bool send_append_entries(const NodeId& peer, const AppendEntriesArgs& args,
                              AppendEntriesReply* reply) override {
         json entries = json::array();
         for (auto& e : args.entries) {
             entries.push_back({
-                {"term", e.term}, {"index", e.index}, {"payload", e.payload}
+                {"term", e.term}, {"index", e.index},
+                {"type", (uint8_t)e.type}, {"payload", e.payload}
             });
         }
         json body = {
@@ -77,13 +100,14 @@ public:
 
 private:
     bool post(const NodeId& peer, const std::string& path,
-              const json& body, json* out) {
+              const json& body, json* out, int override_timeout_ms = 0) {
         auto it = peers_.find(peer);
         if (it == peers_.end()) return false;
         const std::string& url = it->second;
+        int t = override_timeout_ms > 0 ? override_timeout_ms : rpc_timeout_ms_;
         httplib::Client cli(url.c_str());
-        cli.set_connection_timeout(0, rpc_timeout_ms_ * 1000);
-        cli.set_read_timeout(0, rpc_timeout_ms_ * 1000);
+        cli.set_connection_timeout(0, t * 1000);
+        cli.set_read_timeout(0, t * 1000);
         cli.set_keep_alive(true);
         httplib::Headers h{{"X-Delta-Cluster-Token", token_},
                            {"Content-Type", "application/json"}};

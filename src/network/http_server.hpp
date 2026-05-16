@@ -12,11 +12,13 @@
 #include "connection_pool.hpp"
 #include "replication.hpp"
 #include "raft.hpp"
+#include "../cluster/shard_router.hpp"
 #include <algorithm>
 #include <httplib.h>
 #include <fstream>
 #include <sstream>
 #include <array>
+#include <set>
 #include <unordered_map>
 #include <shared_mutex>
 
@@ -176,6 +178,21 @@ public:
     // BEFORE listen() (the route registration is one-shot in setup_cluster_routes).
     void set_raft(raft::RaftNode* r) { raft_ = r; }
 
+    // Round 3 sharding gateway. Pass the (shard_map, local_shard_id) AND
+    // the shared cluster_token used for inter-shard proxy headers. Empty
+    // shard_map (default) keeps the gateway inert and every request lands
+    // locally — i.e. single-shard mode. Call BEFORE listen().
+    void set_sharding(cluster::ShardMap map, std::string local_shard,
+                      std::string cluster_token, int rpc_timeout_ms = 2500) {
+        shard_map_       = std::move(map);
+        local_shard_     = std::move(local_shard);
+        shard_token_     = std::move(cluster_token);
+        shard_rpc_ms_    = rpc_timeout_ms;
+    }
+    bool sharding_enabled() const { return !shard_map_.empty(); }
+    const cluster::ShardMap& shard_map() const { return shard_map_; }
+    const std::string& local_shard() const { return local_shard_; }
+
     void listen(const std::string& host, int port) {
         std::cout << "[Delta] HTTP listening on " << host << ":" << port
                   << " threads=" << thread_count_
@@ -292,7 +309,11 @@ private:
                 Logger::clear_trace_id();
                 return httplib::Server::HandlerResponse::Handled;
             }
-            return httplib::Server::HandlerResponse::Unhandled;
+            // Round 3 sharding gateway hook. shard_prefilter() decides
+            // whether to forward, fan-out, or pass through. It MUST run
+            // after the rate-limit / replica-reject checks above so a
+            // forwarded request still gets rate-limited at the gateway.
+            return shard_prefilter(req, res);
         });
 
         // Post-routing: latency observation + slow-query log + access log
@@ -440,6 +461,12 @@ private:
     ConnectionPool* pool_;
     ReplicationManager* repl_;
     raft::RaftNode* raft_ = nullptr;
+
+    // Round 3 sharding state. shard_map_ being empty disables the gateway.
+    cluster::ShardMap shard_map_;
+    std::string       local_shard_;
+    std::string       shard_token_;
+    int               shard_rpc_ms_ = 2500;
     // P2-2 (TLS): we keep a unique_ptr that owns either a plain
     // httplib::Server or, when DELTA_TLS=ON and enable_tls() was called
     // before listen(), an httplib::SSLServer. The reference srv_ binds to
@@ -465,7 +492,13 @@ private:
             case Status::FORBIDDEN: return 403;
             case Status::ERROR: return 500;
             case Status::INTERNAL: return 500;
-            default: return 200;
+            case Status::CONFLICT: return 409;
+            case Status::UNSUPPORTED: return 501;
+            default:
+                // Pass through anything already in HTTP-status range so
+                // err(res, 503, "...") works verbatim.
+                if (code >= 100 && code <= 599) return code;
+                return 200;
         }
     }
     void send_json(httplib::Response& res, int code, const json& body) {
@@ -494,8 +527,555 @@ private:
         try { return json::parse(req.body); } catch(...) { return json::object(); }
     }
 
-    // Authenticate request, returns session
+    // -----------------------------------------------------------------------
+    // Round 3 — sharding gateway helpers.
+    //
+    // shard_forward(): proxy this request to ANY peer of the target shard.
+    //   We prefer the configured first peer, but if it returns a 503 with
+    //   a `data.leader_id` body we retry once against that peer (single
+    //   redirect — beyond that the operator likely has a quorum problem).
+    //
+    // shard_fanout(): scatter the same request to every shard's first
+    //   peer in parallel and merge the JSON response bodies. Used for
+    //   document search / list / aggregate where no single shard owns
+    //   the answer.
+    //
+    // A request hitting THIS process is considered "local" once it's
+    // already been routed by an upstream gateway. We detect that with
+    // the `X-Delta-Shard-Hop` header so a follow-on forward doesn't
+    // bounce forever between peers.
+    // -----------------------------------------------------------------------
+    bool req_is_local_hop(const httplib::Request& req) const {
+        return req.has_header("X-Delta-Shard-Hop") &&
+               !req.get_header_value("X-Delta-Shard-Hop").empty();
+    }
+
+    // Forward `req` verbatim to `peer_url`. On success copies the upstream
+    // body + status into `res`. On transport failure (peer unreachable),
+    // returns false so the caller can try another peer.
+    bool shard_proxy_once(const std::string& peer_url,
+                          const httplib::Request& req,
+                          httplib::Response& res) {
+        httplib::Client cli(peer_url.c_str());
+        // sec + usec form; pass sec >= 1 to avoid edge cases in some
+        // older httplib versions that treat (0, x) as "no wait".
+        int sec  = shard_rpc_ms_ / 1000;
+        int usec = (shard_rpc_ms_ % 1000) * 1000;
+        if (sec < 1) { sec = 1; usec = 0; }
+        cli.set_connection_timeout(sec, usec);
+        cli.set_read_timeout(sec, usec);
+        cli.set_keep_alive(false);
+        httplib::Headers h;
+        // Pass through auth + cluster headers. Add our hop marker so the
+        // upstream peer doesn't try to re-forward.
+        for (auto& [k, v] : req.headers) {
+            if (k == "Host" || k == "Content-Length") continue;
+            h.emplace(k, v);
+        }
+        h.emplace("X-Delta-Shard-Hop", local_shard_.empty() ? "?" : local_shard_);
+        if (!shard_token_.empty())
+            h.emplace("X-Delta-Cluster-Token", shard_token_);
+        // Round 3: propagate the gateway-validated user identity so the
+        // receiving shard can apply the same identity without replicating
+        // the session DB. require_auth() on the receiving side honours
+        // this header when paired with a matching X-Delta-Cluster-Token.
+        if (!shard_token_.empty()) {
+            auth::Session s;
+            httplib::Response throwaway;
+            if (require_auth(req, throwaway, &s)) {
+                h.emplace("X-Delta-Internal-User",   s.username);
+                h.emplace("X-Delta-Internal-DB",     s.database);
+                h.emplace("X-Delta-Internal-Schema", s.schema);
+            }
+        }
+        std::string path = req.path;
+        if (!req.params.empty()) {
+            path += "?";
+            bool first = true;
+            for (auto& [k, v] : req.params) {
+                if (!first) path += "&";
+                first = false;
+                path += httplib::detail::encode_url(k);
+                path += "=";
+                path += httplib::detail::encode_url(v);
+            }
+        }
+        httplib::Result rr;
+        if (req.method == "GET") {
+            rr = cli.Get(path.c_str(), h);
+        } else if (req.method == "DELETE") {
+            rr = cli.Delete(path.c_str(), h);
+        } else if (req.method == "PATCH") {
+            rr = cli.Patch(path.c_str(), h, req.body, "application/json");
+        } else if (req.method == "POST") {
+            rr = cli.Post(path.c_str(), h, req.body, "application/json");
+        } else if (req.method == "PUT") {
+            rr = cli.Put(path.c_str(), h, req.body, "application/json");
+        } else {
+            return false;
+        }
+        if (!rr) return false;
+        res.status = rr->status;
+        // Preserve upstream content-type so binary blobs (e.g. /admin/backup)
+        // survive proxying intact.
+        auto ct = rr->get_header_value("Content-Type");
+        if (ct.empty()) ct = "application/json";
+        res.set_content(rr->body, ct.c_str());
+        return true;
+    }
+
+    // Extract a document id from a routing path like
+    //   /api/v1/collections/{c}/documents/{id}[/...]
+    // Returns empty string when not a per-document URL.
+    std::string extract_doc_id_from_path(const std::string& path) const {
+        static const std::string p = "/api/v1/collections/";
+        if (path.rfind(p, 0) != 0) return std::string();
+        // Skip the collection name segment.
+        size_t a = p.size();
+        size_t b = path.find('/', a);
+        if (b == std::string::npos) return std::string();
+        static const std::string seg = "/documents/";
+        if (path.compare(b, seg.size(), seg) != 0) return std::string();
+        size_t c = b + seg.size();
+        size_t d = path.find('/', c);
+        std::string id = path.substr(c, d == std::string::npos ? std::string::npos : d - c);
+        // Reserved sub-routes that LOOK like ids but aren't documents:
+        if (id == "search" || id == "bulk") return std::string();
+        return id;
+    }
+
+    // Walk a transaction body and return:
+    //   - shards_touched: distinct shard ids any op writes/reads
+    //   - examples: helpful debug strings (op + id)
+    // For ops missing an id (insert with no _id) we treat the op as
+    // requiring a server-side id allocation — we generate it now and
+    // patch the body before forwarding.
+    std::set<std::string> tx_shards_for_body(json& body) {
+        std::set<std::string> touched;
+        if (!body.contains("ops") || !body["ops"].is_array()) return touched;
+        for (auto& o : body["ops"]) {
+            if (!o.is_object()) continue;
+            std::string kind = o.value("op", std::string());
+            std::string id;
+            if (kind == "insert") {
+                if (o.contains("doc") && o["doc"].is_object() &&
+                    o["doc"].contains("_id") && o["doc"]["_id"].is_string()) {
+                    id = o["doc"]["_id"].get<std::string>();
+                } else {
+                    // Allocate now so routing is deterministic. The local
+                    // handler accepts pre-set _id.
+                    id = gen_id();
+                    if (!o.contains("doc") || !o["doc"].is_object())
+                        o["doc"] = json::object();
+                    o["doc"]["_id"] = id;
+                }
+            } else if (kind == "update" || kind == "remove") {
+                id = o.value("id", std::string());
+            }
+            if (!id.empty()) touched.insert(shard_map_.route(id));
+        }
+        return touched;
+    }
+
+    // Forward to one of the target shard's peers. Returns true once the
+    // proxy roundtrip completed (regardless of upstream status code).
+    bool shard_forward(const cluster::ShardSpec& target,
+                       const httplib::Request& req,
+                       httplib::Response& res) {
+        // Try peers in order; on transport failure move to the next.
+        // Beyond a single 503 leader-hint redirect we don't chase the
+        // chain — the operator's HTTP client gets the 503 and retries.
+        for (size_t i = 0; i < target.peers.size(); ++i) {
+            if (shard_proxy_once(target.peers[i].base_url(), req, res)) {
+                return true;
+            }
+        }
+        err(res, 503, "shard " + target.id + " unreachable");
+        return true;
+    }
+
+    // ---- Per-endpoint gateway handlers -----------------------------------
+    // Each of these is invoked from the pre-routing prefilter when a
+    // sharded route needs cross-shard help. They ALWAYS write a response;
+    // returning true means the prefilter must report Handled.
+
+    // POST /api/v1/collections/{c}/documents — single insert without an id
+    // in the URL. We allocate _id locally so routing is deterministic,
+    // then either handle locally (by mutating req.body in place) or
+    // forward to the owning shard.
+    //
+    // Why we don't loopback-forward to ourselves: cpp-httplib's worker
+    // thread is the same thread executing this prefilter; if we open a
+    // sync httplib::Client to our own port we deadlock until the worker
+    // pool drains. Worse, on macOS the self-connect occasionally returns
+    // ECONNREFUSED outright. So when target == local_shard_ we patch the
+    // request body via const_cast and return Unhandled so the regular
+    // POST /documents route runs in-process.
+    // Returns true if this handler should ABORT (i.e. response has been
+    // fully written by the gateway forwarding/rejection logic). Returns
+    // false if the local handler must continue (possibly with the request
+    // body mutated in place by us). Called from inside route handlers
+    // because httplib's pre-routing handler runs BEFORE the body is read
+    // from the socket — see `Server::routing()` in httplib.h, the
+    // pre_routing_handler_ check is the first line.
+    //
+    // `parsed_body` is the already-parsed body owned by the caller; if we
+    // allocate a fresh _id we patch it into the caller's json so the
+    // local handler honours it.
+    bool gateway_handle_single_insert(const httplib::Request& req,
+                                      httplib::Response& res,
+                                      json& parsed_body) {
+        if (!sharding_enabled() || req_is_local_hop(req)) return false;
+        std::string id;
+        json& doc_field = parsed_body.contains("document") &&
+                          parsed_body["document"].is_object()
+                ? parsed_body["document"]
+                : parsed_body;
+        if (parsed_body.contains("id") && parsed_body["id"].is_string()) {
+            id = parsed_body["id"].get<std::string>();
+            doc_field["_id"] = id;
+        } else if (doc_field.contains("_id") && doc_field["_id"].is_string()) {
+            id = doc_field["_id"].get<std::string>();
+        } else {
+            id = gen_id();
+            doc_field["_id"] = id;
+        }
+        const cluster::ShardId& target = shard_map_.route(id);
+        if (target == local_shard_) return false;
+        auto* spec = shard_map_.find_shard(target);
+        if (!spec) { err(res, 500, "unknown target shard"); return true; }
+        httplib::Request modified = req;
+        modified.body = parsed_body.dump();
+        shard_forward(*spec, modified, res);
+        return true;
+    }
+
+    // POST /api/v1/collections/{c}/documents/bulk — invoked from the
+    // local bulk handler with the parsed body. Returns true if the
+    // gateway fully serviced the request (response already written).
+    //
+    // Strategy: split docs by owning shard. Forward each REMOTE shard's
+    // subset via a synthetic POST. For the LOCAL shard's subset we
+    // rewrite the request body in place and let the caller continue.
+    bool gateway_handle_bulk_insert(const httplib::Request& req,
+                                    httplib::Response& res,
+                                    json& parsed_body) {
+        if (!sharding_enabled() || req_is_local_hop(req)) return false;
+        // Tolerate "docs" or "documents".
+        std::string key = parsed_body.contains("docs") ? "docs" : "documents";
+        if (!parsed_body.contains(key) || !parsed_body[key].is_array()) return false;
+        std::unordered_map<cluster::ShardId, json> per_shard;
+        std::vector<std::string> all_ids;
+        json local_subset = json::array();
+        for (auto& item : parsed_body[key]) {
+            if (!item.is_object()) continue;
+            json* doc = &item;
+            if (item.contains("document") && item["document"].is_object())
+                doc = &item["document"];
+            std::string id;
+            if (doc->contains("_id") && (*doc)["_id"].is_string()) {
+                id = (*doc)["_id"].get<std::string>();
+            } else {
+                id = gen_id();
+                (*doc)["_id"] = id;
+            }
+            all_ids.push_back(id);
+            cluster::ShardId tgt = shard_map_.route(id);
+            if (tgt == local_shard_) {
+                local_subset.push_back(item);
+            } else {
+                if (!per_shard.count(tgt))
+                    per_shard[tgt] = json{{key, json::array()}};
+                per_shard[tgt][key].push_back(item);
+            }
+        }
+        int inserted = 0;
+        std::mutex mu;
+        std::vector<std::thread> workers;
+        for (auto& [sid, sbody] : per_shard) {
+            auto* spec = shard_map_.find_shard(sid);
+            if (!spec) continue;
+            workers.emplace_back([this, &mu, &inserted, &req, spec, sbody]() {
+                httplib::Request modified = req;
+                modified.body = sbody.dump();
+                httplib::Response sub;
+                shard_forward(*spec, modified, sub);
+                try {
+                    json env = json::parse(sub.body);
+                    int n = 0;
+                    if (env.contains("data") && env["data"].contains("inserted"))
+                        n = env["data"]["inserted"].get<int>();
+                    std::lock_guard<std::mutex> lk(mu);
+                    inserted += n;
+                } catch (...) {}
+            });
+        }
+        for (auto& w : workers) if (w.joinable()) w.join();
+        // Local subset: hand back through local handler. We can't easily
+        // re-enter mid-handler, so we run the engine inserts inline here.
+        if (!local_subset.empty()) {
+            auth::Session s;
+            if (require_auth(req, res, &s)) {
+                std::string col_name = req.matches[1];
+                std::string db = req.get_param_value("database");
+                if (db.empty()) db = s.database;
+                std::string sch = req.get_param_value("schema");
+                if (sch.empty()) sch = s.schema;
+                for (auto& item : local_subset) {
+                    json doc = item.contains("document") && item["document"].is_object()
+                             ? item["document"] : item;
+                    std::string id;
+                    if (col_->insert(db, sch, col_name, doc, id).ok()) inserted++;
+                }
+            }
+        }
+        ok(res, json{{"inserted", inserted}, {"ids", all_ids}});
+        return true;
+    }
+
+    // POST /api/v1/collections/{c}/documents/search — fan-out. For v1 we
+    // concatenate documents from each shard and apply the requested
+    // `limit`/`skip` to the merged stream. Server-side `sort` is honoured
+    // only as a final stable resort by the gateway (a real distributed
+    // sort would push partial sort + top-k to each shard; out of scope
+    // for the first cut).
+    bool shard_fanout_documents_search(const httplib::Request& req,
+                                       httplib::Response& res) {
+        std::vector<json> docs_all;
+        size_t total_all = 0;
+        std::mutex mu;
+        std::string dummy;
+        shard_fanout(req, [&](const json& env) {
+            if (!env.contains("data")) return;
+            const json& d = env["data"];
+            std::lock_guard<std::mutex> lk(mu);
+            if (d.contains("documents") && d["documents"].is_array()) {
+                for (auto& doc : d["documents"]) docs_all.push_back(doc);
+            }
+            if (d.contains("total") && d["total"].is_number())
+                total_all += d["total"].get<size_t>();
+        }, dummy);
+        // Re-apply skip + limit on the merged set so a multi-shard call
+        // doesn't return N*limit docs to the caller. Aggregation-aware
+        // sorting is a follow-up; for now we keep input order.
+        json body;
+        try { body = json::parse(req.body); } catch (...) {}
+        size_t skip  = body.value("skip",  (size_t)0);
+        size_t limit = body.value("limit", (size_t)0);
+        if (limit > 0 || skip > 0) {
+            if (skip > docs_all.size()) docs_all.clear();
+            else docs_all.erase(docs_all.begin(), docs_all.begin() + skip);
+            if (limit > 0 && docs_all.size() > limit) docs_all.resize(limit);
+        }
+        ok(res, json{
+            {"documents", docs_all},
+            {"total",     total_all},
+            {"skip",      skip},
+            {"limit",     limit},
+        });
+        return true;
+    }
+
+    // POST /api/v1/collections/{c}/aggregate — fan-out. We concatenate
+    // each shard's pipeline result. This is correct for pure `$match` /
+    // `$project` / `$unwind` pipelines and approximate for pipelines that
+    // include `$group` / `$sort` / `$limit` (the gateway runs none of the
+    // distributed-merge logic for those stages). Operators expecting
+    // global-aggregation correctness across shards should keep the data
+    // co-resident (single shard) or run `$group` themselves on the
+    // gateway side.
+    bool shard_fanout_aggregate(const httplib::Request& req,
+                                httplib::Response& res) {
+        json merged = json::array();
+        std::mutex mu;
+        std::string dummy;
+        shard_fanout(req, [&](const json& env) {
+            if (!env.contains("data")) return;
+            const json& d = env["data"];
+            std::lock_guard<std::mutex> lk(mu);
+            if (d.is_array()) for (auto& r : d) merged.push_back(r);
+            else if (d.is_object() && d.contains("result") && d["result"].is_array())
+                for (auto& r : d["result"]) merged.push_back(r);
+        }, dummy);
+        ok(res, merged);
+        return true;
+    }
+
+    // POST /api/v1/collections/{c}/count — fan-out + sum.
+    bool shard_fanout_count(const httplib::Request& req,
+                            httplib::Response& res) {
+        std::atomic<uint64_t> total{0};
+        std::string dummy;
+        shard_fanout(req, [&](const json& env) {
+            if (!env.contains("data") || !env["data"].contains("count")) return;
+            total.fetch_add(env["data"]["count"].get<uint64_t>());
+        }, dummy);
+        ok(res, json{{"count", (uint64_t)total.load()}});
+        return true;
+    }
+
+    // POST /api/v1/transactions/execute — cross-shard tx detection,
+    // invoked from the local handler with the parsed body.
+    bool gateway_handle_transaction(const httplib::Request& req,
+                                    httplib::Response& res,
+                                    json& parsed_body) {
+        if (!sharding_enabled() || req_is_local_hop(req)) return false;
+        auto touched = tx_shards_for_body(parsed_body);
+        if (touched.empty()) return false;
+        if (touched.size() > 1) {
+            send_json(res, Status::UNSUPPORTED, json{
+                {"message", "cross-shard transactions are not supported "
+                            "in this release"},
+                {"data", json{{"shards", std::vector<std::string>(
+                    touched.begin(), touched.end())}}}
+            });
+            return true;
+        }
+        const cluster::ShardId& target = *touched.begin();
+        if (target == local_shard_) return false;
+        auto* spec = shard_map_.find_shard(target);
+        if (!spec) { err(res, 500, "unknown target shard"); return true; }
+        httplib::Request modified = req;
+        modified.body = parsed_body.dump();
+        shard_forward(*spec, modified, res);
+        return true;
+    }
+
+    // Scatter the same request to every shard in `shard_map_` in parallel
+    // (including the local one, which goes through loopback so the local
+    // handler still runs and merges its own data). The caller supplies
+    // `merge_fn` to combine result bodies. The merged body is returned in
+    // `out`; the per-shard upstream status is summarised in `out_codes`.
+    void shard_fanout(const httplib::Request& req,
+                      std::function<void(const json&)> per_shard_body,
+                      std::string& out_method_dummy /*kept for symmetry*/) {
+        (void)out_method_dummy;
+        std::vector<std::thread> workers;
+        std::mutex mu;
+        for (auto& sh : shard_map_.shards()) {
+            workers.emplace_back([&, sh]() {
+                if (sh.peers.empty()) return;
+                // For the local shard, hit our own port via 127.0.0.1.
+                // (The hop header keeps the local handler from forwarding.)
+                std::string url;
+                if (sh.id == local_shard_) {
+                    // Loopback: any peer of our shard works, but we use
+                    // the first one (which is normally ourselves).
+                    url = sh.peers.front().base_url();
+                } else {
+                    url = sh.peers.front().base_url();
+                }
+                httplib::Client cli(url.c_str());
+                cli.set_connection_timeout(0, shard_rpc_ms_ * 1000);
+                cli.set_read_timeout(0, shard_rpc_ms_ * 1000);
+                httplib::Headers h;
+                for (auto& [k, v] : req.headers) {
+                    if (k == "Host" || k == "Content-Length") continue;
+                    h.emplace(k, v);
+                }
+                h.emplace("X-Delta-Shard-Hop", local_shard_.empty() ? "?" : local_shard_);
+                if (!shard_token_.empty())
+                    h.emplace("X-Delta-Cluster-Token", shard_token_);
+                std::string path = req.path;
+                if (!req.params.empty()) {
+                    path += "?";
+                    bool first = true;
+                    for (auto& [k, v] : req.params) {
+                        if (!first) path += "&";
+                        first = false;
+                        path += httplib::detail::encode_url(k);
+                        path += "=";
+                        path += httplib::detail::encode_url(v);
+                    }
+                }
+                httplib::Result rr;
+                if (req.method == "GET")        rr = cli.Get(path.c_str(), h);
+                else if (req.method == "POST")  rr = cli.Post(path.c_str(), h, req.body, "application/json");
+                else if (req.method == "DELETE")rr = cli.Delete(path.c_str(), h);
+                else if (req.method == "PATCH") rr = cli.Patch(path.c_str(), h, req.body, "application/json");
+                if (!rr) return;
+                try {
+                    json env = json::parse(rr->body);
+                    std::lock_guard<std::mutex> lk(mu);
+                    per_shard_body(env);
+                } catch (...) {}
+            });
+        }
+        for (auto& w : workers) if (w.joinable()) w.join();
+    }
+
+    // Broadcast a write to every PEER shard (skips local). Used for
+    // collection metadata replication. Best-effort + parallel; we don't
+    // fail the local op if a peer is unreachable, but we do log it.
+    // The hop header is set so peers don't re-broadcast.
+    void broadcast_to_peer_shards(const httplib::Request& req,
+                                  const std::string& method,
+                                  const std::string& path,
+                                  const std::string& body) {
+        if (!sharding_enabled() || req_is_local_hop(req)) return;
+        std::vector<std::thread> workers;
+        for (auto& sh : shard_map_.shards()) {
+            if (sh.id == local_shard_) continue;
+            if (sh.peers.empty()) continue;
+            std::string url = sh.peers.front().base_url();
+            workers.emplace_back([this, url, method, path, body, &req]() {
+                httplib::Client cli(url.c_str());
+                int sec  = shard_rpc_ms_ / 1000;
+                int usec = (shard_rpc_ms_ % 1000) * 1000;
+                if (sec < 1) { sec = 1; usec = 0; }
+                cli.set_connection_timeout(sec, usec);
+                cli.set_read_timeout(sec, usec);
+                cli.set_keep_alive(false);
+                httplib::Headers h;
+                for (auto& [k, v] : req.headers) {
+                    if (k == "Host" || k == "Content-Length") continue;
+                    h.emplace(k, v);
+                }
+                h.emplace("X-Delta-Shard-Hop",     local_shard_.empty() ? "?" : local_shard_);
+                if (!shard_token_.empty()) {
+                    h.emplace("X-Delta-Cluster-Token", shard_token_);
+                    auth::Session s;
+                    httplib::Response throwaway;
+                    if (require_auth(req, throwaway, &s)) {
+                        h.emplace("X-Delta-Internal-User",   s.username);
+                        h.emplace("X-Delta-Internal-DB",     s.database);
+                        h.emplace("X-Delta-Internal-Schema", s.schema);
+                    }
+                }
+                if (method == "POST")        cli.Post(path.c_str(), h, body, "application/json");
+                else if (method == "PUT")    cli.Put(path.c_str(), h, body, "application/json");
+                else if (method == "PATCH")  cli.Patch(path.c_str(), h, body, "application/json");
+                else if (method == "DELETE") cli.Delete(path.c_str(), h);
+            });
+        }
+        for (auto& w : workers) if (w.joinable()) w.join();
+    }
+
+    // Authenticate request, returns session.
+    //
+    // Round 3 — internal trust path: when a request carries
+    //   X-Delta-Cluster-Token: <secret>   (matches our shard_token_)
+    //   X-Delta-Internal-User: <username>
+    // we synthesise a session for that user WITHOUT consulting the local
+    // SessionManager. This is how the sharding gateway propagates an
+    // already-validated user identity across shard boundaries without
+    // having to replicate the session DB. Security: the cluster token
+    // is a shared secret known only to operator-configured nodes, so a
+    // third party cannot forge it.
     bool require_auth(const httplib::Request& req, httplib::Response& res, auth::Session* out_sess) {
+        if (!shard_token_.empty() &&
+            req.get_header_value("X-Delta-Cluster-Token") == shard_token_ &&
+            req.has_header("X-Delta-Internal-User")) {
+            std::string user = req.get_header_value("X-Delta-Internal-User");
+            out_sess->token    = "internal";
+            out_sess->username = user;
+            out_sess->database = req.get_header_value("X-Delta-Internal-DB");
+            if (out_sess->database.empty()) out_sess->database = "default";
+            out_sess->schema   = req.get_header_value("X-Delta-Internal-Schema");
+            if (out_sess->schema.empty()) out_sess->schema = "public";
+            out_sess->client_ip = req.remote_addr;
+            return true;
+        }
         std::string token;
         auto auth_h = req.get_header_value("Authorization");
         if (auth_h.rfind("Bearer ", 0) == 0) token = auth_h.substr(7);
@@ -559,6 +1139,70 @@ private:
                 res.set_header("Access-Control-Allow-Credentials", "true");
         }
         return allowed;
+    }
+
+    // Round 3 — sharding pre-routing decision. Called from the (single)
+    // pre_routing_handler installed by tune_for_high_concurrency(); see
+    // there for the chain order (trace-id → rate-limit → replica-rw → THIS).
+    //
+    // Returns Handled when sharding fully serviced the request (forward,
+    // fan-out, or 501); Unhandled otherwise (local handler should run).
+    // URL-only routing decisions runnable in the pre-routing handler
+    // (which is invoked BEFORE httplib reads the request body — see
+    // Server::routing() in third_party/httplib.h:6401). Body-dependent
+    // routing (single insert, bulk, transactions) is performed inside
+    // the actual route handler via the gateway_handle_* helpers.
+    httplib::Server::HandlerResponse shard_prefilter(
+            const httplib::Request& req, httplib::Response& res) {
+        using HR = httplib::Server::HandlerResponse;
+        if (!sharding_enabled()) return HR::Unhandled;
+        if (req_is_local_hop(req)) return HR::Unhandled;
+
+        const std::string& path = req.path;
+        if (path == "/api/v1/health" || path == "/metrics" ||
+            path == "/llms.txt" ||
+            path.rfind("/api/v1/cluster/", 0) == 0 ||
+            path.rfind("/api/v1/auth/",    0) == 0 ||
+            path.rfind("/api/v1/admin/",   0) == 0) {
+            return HR::Unhandled;
+        }
+        // Per-document point ops (URL contains the doc id).
+        if (path.rfind("/api/v1/collections/", 0) == 0 &&
+            path.find("/documents/") != std::string::npos) {
+            if (path.size() >= 7 &&
+                path.substr(path.size() - 7) == "/search") {
+                return shard_fanout_documents_search(req, res) ? HR::Handled : HR::Unhandled;
+            }
+            if (path.size() >= 5 &&
+                path.substr(path.size() - 5) == "/bulk") {
+                // bulk needs body → handled in-route, not in prefilter.
+                return HR::Unhandled;
+            }
+            std::string id = extract_doc_id_from_path(path);
+            if (id.empty()) return HR::Unhandled;
+            const cluster::ShardId& target = shard_map_.route(id);
+            if (target == local_shard_) return HR::Unhandled;
+            auto* spec = shard_map_.find_shard(target);
+            if (!spec) { err(res, 500, "unknown target shard " + target); return HR::Handled; }
+            shard_forward(*spec, req, res);
+            return HR::Handled;
+        }
+        // Aggregation pipelines: fan-out is body-independent for our
+        // gateway (we just re-issue the same body to every shard and
+        // concatenate). Safe to do in the prefilter.
+        if (path.rfind("/api/v1/collections/", 0) == 0 &&
+            req.method == "POST" &&
+            path.size() > 10 &&
+            path.substr(path.size() - 10) == "/aggregate") {
+            return shard_fanout_aggregate(req, res) ? HR::Handled : HR::Unhandled;
+        }
+        if (path.rfind("/api/v1/collections/", 0) == 0 &&
+            req.method == "POST" &&
+            path.size() > 6 &&
+            path.substr(path.size() - 6) == "/count") {
+            return shard_fanout_count(req, res) ? HR::Handled : HR::Unhandled;
+        }
+        return HR::Unhandled;
     }
 
     void setup_routes() {
@@ -848,6 +1492,12 @@ private:
             if (b.contains("indexes")) for (auto& idx : b["indexes"]) m.indexes.push_back(IndexDef::from_json(idx));
             auto st = col_->create_collection(m);
             if (!st.ok()) { err(res, st.code, st.message); return; }
+            // Round 3: collection metadata MUST exist on every shard so
+            // document ops on any owning shard succeed. Broadcast the
+            // create to every PEER shard. Idempotent: ALREADY_EXISTS on
+            // a peer is treated as success.
+            broadcast_to_peer_shards(req, "POST", "/api/v1/collections",
+                                     b.dump());
             ok(res, m.to_json());
         });
         srv_.Get("/api/v1/collections", [this](const httplib::Request& req, httplib::Response& res) {
@@ -904,6 +1554,10 @@ private:
             std::string sch = req.get_param_value("schema"); if (sch.empty()) sch = s.schema;
             if (!require_perm(res, s, auth::PRIV_INSERT, col_target(db, sch, col_name))) return;
             json b = parse_body(req);
+            // Round 3 sharding hook: route by doc _id (allocated here if
+            // missing). If the owning shard is remote, gateway_handle_*
+            // forwards verbatim and writes the response; we abort here.
+            if (gateway_handle_single_insert(req, res, b)) return;
             json doc = b.contains("document") ? b["document"] : b;
             if (b.contains("id")) doc["_id"] = b["id"];
             // RLS check
@@ -920,6 +1574,8 @@ private:
             std::string col_name = req.matches[1];
             std::string db = req.get_param_value("database"); if (db.empty()) db = s.database;
             std::string sch = req.get_param_value("schema"); if (sch.empty()) sch = s.schema;
+            json bulk_body = parse_body(req);
+            if (gateway_handle_bulk_insert(req, res, bulk_body)) return;
             if (!require_perm(res, s, auth::PRIV_INSERT, col_target(db, sch, col_name))) return;
             json b = parse_body(req);
             json ids = json::array();
@@ -1051,6 +1707,10 @@ private:
         srv_.Post(R"(/api/v1/transactions/execute)", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
             json body = parse_body(req);
+            // Round 3 sharding hook: walk ops, gen ids for inserts that
+            // omit them, ensure all ops route to the same shard. Returns
+            // true on remote-forward / 501 reject.
+            if (gateway_handle_transaction(req, res, body)) return;
             if (!body.is_object() || !body.contains("ops") || !body["ops"].is_array()) {
                 err(res, Status::INVALID, "body must contain ops array");
                 return;
@@ -1665,6 +2325,8 @@ private:
                         raft::LogEntry le;
                         le.term    = e.value("term",    (raft::Term)0);
                         le.index   = e.value("index",   (raft::Index)0);
+                        le.type    = (raft::LogEntry::Type)e.value("type",
+                                            (uint8_t)raft::LogEntry::Normal);
                         le.payload = e.value("payload", std::string());
                         a.entries.push_back(std::move(le));
                     }
@@ -1679,6 +2341,43 @@ private:
                 });
             });
 
+        // GET /api/v1/cluster/shards — Round 3 introspection. Always
+        // available (even on non-sharded nodes — reports enabled=false).
+        srv_.Get("/api/v1/cluster/shards",
+            [this](const httplib::Request&, httplib::Response& res) {
+                if (!sharding_enabled()) {
+                    ok(res, json{{"enabled", false}});
+                    return;
+                }
+                ok(res, json{
+                    {"enabled",        true},
+                    {"local_shard",    local_shard_},
+                    {"vnodes",         shard_map_.vnodes()},
+                    {"shard_count",    shard_map_.shard_count()},
+                    {"topology",       shard_map_.to_json()["shards"]},
+                });
+            });
+
+        // GET /api/v1/cluster/shards/route?key=<id> — return the shard
+        // that would own `key`. Useful for clients that want to bypass
+        // the gateway and connect directly to the owning shard.
+        srv_.Get("/api/v1/cluster/shards/route",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!sharding_enabled()) {
+                    err(res, 503, "sharding not enabled"); return;
+                }
+                std::string key = req.get_param_value("key");
+                if (key.empty()) { err(res, Status::INVALID, "key required"); return; }
+                const auto& sid = shard_map_.route(key);
+                auto* spec = shard_map_.find_shard(sid);
+                json peers = json::array();
+                if (spec) for (auto& p : spec->peers) {
+                    peers.push_back({{"node_id", p.node_id},
+                                     {"base_url", p.base_url()}});
+                }
+                ok(res, json{{"key", key}, {"shard_id", sid}, {"peers", peers}});
+            });
+
         srv_.Get("/api/v1/cluster/raft/status",
             [this](const httplib::Request&, httplib::Response& res) {
                 if (!raft_) {
@@ -1691,7 +2390,8 @@ private:
                     {"current_term",   raft_->current_term()},
                     {"leader_id",      raft_->leader_id()},
                     {"commit_index",   raft_->commit_index()},
-                    {"last_log_index", raft_->last_log_index()}
+                    {"last_log_index", raft_->last_log_index()},
+                    {"peers",          raft_->peers()}
                 });
             });
 
@@ -1717,6 +2417,110 @@ private:
                     return;
                 }
                 ok(res, json{{"index", idx}});
+            });
+
+        // POST /api/v1/cluster/raft/install_snapshot — peer-to-peer.
+        // Body: {term, leader_id, last_included_index, last_included_term,
+        //        data, peers}. Token-gated like the other RPC endpoints.
+        srv_.Post("/api/v1/cluster/raft/install_snapshot",
+            [this, token_check](const httplib::Request& req, httplib::Response& res) {
+                if (!token_check(req, res)) return;
+                if (!raft_) { err(res, 503, "raft not configured"); return; }
+                json b = parse_body(req);
+                raft::InstallSnapshotArgs a;
+                a.term                = b.value("term", (raft::Term)0);
+                a.leader_id           = b.value("leader_id", std::string());
+                a.last_included_index = b.value("last_included_index", (raft::Index)0);
+                a.last_included_term  = b.value("last_included_term",  (raft::Term)0);
+                a.data                = b.value("data",                std::string());
+                if (b.contains("peers") && b["peers"].is_array())
+                    a.peers = b["peers"].get<std::vector<std::string>>();
+                raft::InstallSnapshotReply r;
+                raft_->handle_install_snapshot(a, &r);
+                ok(res, json{{"term", r.term}});
+            });
+
+        // POST /api/v1/cluster/raft/snapshot — admin/test trigger to force
+        // a snapshot now. Returns the resulting last_included_index.
+        srv_.Post("/api/v1/cluster/raft/snapshot",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auth::Session s; if (!require_auth(req, res, &s)) return;
+                if (!auth_->is_superuser(s.username)) {
+                    err(res, Status::FORBIDDEN, "superuser only"); return;
+                }
+                if (!raft_) { err(res, 503, "raft not configured"); return; }
+                raft::Index idx = raft_->snapshot_now();
+                ok(res, json{{"last_included_index", idx}});
+            });
+
+        // POST /api/v1/cluster/raft/add_peer    body: {"peer_id":"...", "url":"host:port"} (url ignored if already known by transport)
+        // POST /api/v1/cluster/raft/remove_peer body: {"peer_id":"..."}
+        // Leader-only. The peer set takes effect immediately on append; the
+        // call returns once the change has been appended to the log.
+        srv_.Post("/api/v1/cluster/raft/add_peer",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auth::Session s; if (!require_auth(req, res, &s)) return;
+                if (!auth_->is_superuser(s.username)) {
+                    err(res, Status::FORBIDDEN, "superuser only"); return;
+                }
+                if (!raft_) { err(res, 503, "raft not configured"); return; }
+                json b = parse_body(req);
+                std::string pid = b.value("peer_id", std::string());
+                if (pid.empty()) { err(res, Status::INVALID, "peer_id required"); return; }
+                auto current = raft_->peers();
+                for (auto& p : current) if (p == pid) {
+                    ok(res, json{{"index", 0}, {"already_member", true}}); return;
+                }
+                current.push_back(pid);
+                raft::Index idx = 0;
+                raft::NodeId hint;
+                if (!raft_->propose_config_change(current, &idx, &hint)) {
+                    res.status = 503;
+                    res.set_content(json{
+                        {"code", 503},
+                        {"message", "not a leader or change in flight"},
+                        {"data", json{{"leader_id", hint}}}
+                    }.dump(), "application/json");
+                    return;
+                }
+                ok(res, json{{"index", idx}, {"peers", current}});
+            });
+
+        srv_.Post("/api/v1/cluster/raft/remove_peer",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auth::Session s; if (!require_auth(req, res, &s)) return;
+                if (!auth_->is_superuser(s.username)) {
+                    err(res, Status::FORBIDDEN, "superuser only"); return;
+                }
+                if (!raft_) { err(res, 503, "raft not configured"); return; }
+                json b = parse_body(req);
+                std::string pid = b.value("peer_id", std::string());
+                if (pid.empty()) { err(res, Status::INVALID, "peer_id required"); return; }
+                auto current = raft_->peers();
+                std::vector<std::string> next;
+                bool found = false;
+                for (auto& p : current) {
+                    if (p == pid) { found = true; continue; }
+                    next.push_back(p);
+                }
+                if (!found) {
+                    ok(res, json{{"index", 0}, {"not_member", true}}); return;
+                }
+                if (next.empty()) {
+                    err(res, Status::INVALID, "cannot remove last peer"); return;
+                }
+                raft::Index idx = 0;
+                raft::NodeId hint;
+                if (!raft_->propose_config_change(next, &idx, &hint)) {
+                    res.status = 503;
+                    res.set_content(json{
+                        {"code", 503},
+                        {"message", "not a leader or change in flight"},
+                        {"data", json{{"leader_id", hint}}}
+                    }.dump(), "application/json");
+                    return;
+                }
+                ok(res, json{{"index", idx}, {"peers", next}});
             });
     }
 };

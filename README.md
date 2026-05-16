@@ -136,7 +136,10 @@ delta/
 │   ├── database/       database_manager.hpp (DB / schema / RLS)
 │   ├── network/        http_server.hpp, deltaql_protocol.hpp,
 │   │                   deltaql_server.hpp, ws_server.hpp,
-│   │                   connection_pool.hpp, replication.hpp
+│   │                   connection_pool.hpp, replication.hpp,
+│   │                   raft.{hpp,cpp}, raft_http_transport.hpp,
+│   │                   raft_lsm_sm.hpp
+│   ├── cluster/        shard_router.hpp  (Round 3 consistent-hash gateway)
 │   └── server/         main.cpp, config.{hpp,cpp}
 ├── llms.txt            standalone HTTP+JSON tutorial with built-in client
 ├── console/            Vue 3 + NaiveUI admin console

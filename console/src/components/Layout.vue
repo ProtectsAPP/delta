@@ -118,6 +118,7 @@ const menuOptions = [
   { key: 'div2', type: 'divider' as const },
   { label: 'Connections', key: 'connections', icon: renderIcon(LinkOutline) },
   { label: 'Cluster', key: 'cluster', icon: renderIcon(GitNetworkOutline) },
+  { label: 'Shards', key: 'shards', icon: renderIcon(GitNetworkOutline) },
   { label: 'Monitor', key: 'monitor', icon: renderIcon(PulseOutline) },
   { label: 'Settings', key: 'settings', icon: renderIcon(SettingsOutline) }
 ];

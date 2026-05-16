@@ -49,6 +49,7 @@ file(GLOB_RECURSE DELTA_SOURCES
   src/vector/*.cpp
   src/index/*.cpp
   src/network/*.cpp
+  src/cluster/*.cpp
 )
 
 add_library(delta_core STATIC ${DELTA_SOURCES})
@@ -68,3 +69,29 @@ foreach(test_src ${TEST_SOURCES})
   target_link_libraries(${test_name} PRIVATE delta_core)
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
+
+# -----------------------------------------------------------------------------
+# Optional multi-process chaos test (Round 2 part 3).
+#
+# Drives three real `delta_server` processes wired with --enable-raft and
+# exercises leader election, replication, kill -9 failover, restart catch-
+# up, and live membership change. Skipped automatically when Python 3 is
+# not on PATH so the default ctest run stays cross-platform.
+# -----------------------------------------------------------------------------
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_test(
+    NAME test_raft_chaos
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tests/integration/raft_chaos.py
+            --binary $<TARGET_FILE:delta_server>
+  )
+  set_tests_properties(test_raft_chaos PROPERTIES TIMEOUT 120)
+  add_test(
+    NAME test_sharding_chaos
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tests/integration/sharding_chaos.py
+            --binary $<TARGET_FILE:delta_server>
+  )
+  set_tests_properties(test_sharding_chaos PROPERTIES TIMEOUT 120)
+endif()

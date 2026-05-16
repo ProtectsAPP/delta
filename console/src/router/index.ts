@@ -21,6 +21,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'policies', component: () => import('@/views/Policies.vue') },
       { path: 'connections', component: () => import('@/views/Connections.vue') },
       { path: 'cluster', component: () => import('@/views/Cluster.vue') },
+      { path: 'shards', component: () => import('@/views/Shards.vue') },
       { path: 'monitor', component: () => import('@/views/Monitor.vue') },
       { path: 'settings', component: () => import('@/views/Settings.vue') }
     ]

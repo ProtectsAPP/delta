@@ -32,17 +32,22 @@ here so an operator can plan around them.
 - Snapshot bootstrap for new replicas (`/cluster/snapshot`)
 - Cluster-token gated control plane
 - Master `apply_replicated()` advances LSN atomically; restore reuses it
-- **Raft consensus core (in tree, HTTP transport live; not yet wired to
-  writes)** — leader election, log replication, §5.4.1 election
-  restriction, §9.6 pre-vote, parallel fan-out for RequestVote and
-  AppendEntries; pluggable `RaftTransport` / `RaftStateMachine`
-  interfaces; file-backed persistent state; HTTP-backed
-  `HttpRaftTransport` over `/api/v1/cluster/raft/{vote,append,status,propose}`
-  endpoints. Six-case in-memory unit suite (`test_raft`) plus a
-  loopback HTTP integration suite (`test_raft_http`) that drives three
-  real `HttpServer` instances through election, replication, and
-  leader failover. The leader-write hook into LSMTree is the last step
-  (Round 2 part 3); manual `promote` remains the only failover today.
+- **Raft consensus (production wiring complete)** — leader election, log
+  replication, §5.4.1 election restriction, §9.6 pre-vote, §7 log
+  compaction via InstallSnapshot, Raft thesis §4.3 single-server
+  membership change. Pluggable `RaftTransport` / `RaftStateMachine`
+  interfaces; file-backed persistent state with snapshot bytes inline;
+  HTTP-backed `HttpRaftTransport` over `/api/v1/cluster/raft/*`.
+  Enable per-node with `--enable-raft --node-id <id> --cluster-peer <id@host:port>`
+  (repeatable). Every `LSMTree::put / del` on the leader synchronously
+  routes through `RaftNode::propose`, waits for commit AND local apply,
+  then returns to the HTTP caller — so a successful 200 means a
+  durably-replicated, locally-visible write. Six unit scenarios
+  (`test_raft`), three LSM-integration scenarios (`test_raft_lsm`), an
+  HTTP loopback suite (`test_raft_http`), and a five-phase multi-process
+  chaos test (`test_raft_chaos`: election → replication → kill -9
+  leader → restart catch-up → live membership remove) all green on the
+  default and TLS builds.
 
 ### Auth / security
 - PBKDF2-HMAC-SHA256 (120,000 iterations) password hashing, PHC-prefixed
@@ -89,34 +94,14 @@ here so an operator can plan around them.
 
 ### Tier A · MUST (target: next 1–2 releases)
 
-#### A.1 Automatic failover
-**Status:** in progress (Round 2 part 2 landed). The full Raft state
-machine and an HTTP-backed transport are in tree:
-  * `src/network/raft.{hpp,cpp}` — leader election, log replication,
-    §5.4.1 election restriction, §9.6 pre-vote, parallel fan-out for
-    RequestVote / AppendEntries
-  * `src/network/raft_http_transport.hpp` — JSON-over-HTTP transport
-    using the existing cluster_token for authentication
-  * `/api/v1/cluster/raft/{vote,append,status,propose}` HTTP endpoints
-    (registered alongside the legacy /cluster/changes streaming) — see
-    `setup_raft_routes()` in http_server.hpp
-  * Tests: `test_raft` (in-memory, six scenarios) + `test_raft_http`
-    (real HttpServer instances on three loopback ports, election +
-    propose + failover end-to-end). Both stress-checked at 30/30 and
-    10/10 consecutive runs.
-
-What's still missing before the production switch:
-  * Leader write hook: replace the current `LSMTree::set_write_hook`
-    fan-out with `RaftNode::propose` + apply-into-LSM on commit
-    (i.e. route every put/del through raft when a cluster is configured).
-  * `cluster_peers` / `node_id` config plumbing in `ServerConfig` so
-    operators can wire raft from the JSON config or CLI flags.
-  * `InstallSnapshot` RPC + log compaction.
-  * Joint-consensus membership change.
-  * Multi-process integration tests + chaos suite.
-**Plan:** these land in the next release. The current manual
-`/cluster/promote` path stays usable until then.
-**Estimated effort remaining:** ~1 week engineering + 1 week chaos.
+#### A.1 Automatic failover — *shipped (rev. May 2026)*
+**Status:** done. Raft is wired through the LSM write path; see the
+"Replication" entry above for the feature list. Operators enable it
+with `--enable-raft --node-id <id> --cluster-peer <id@host:port>` per
+node and the legacy single-master `--role master`/`--role replica`
+streaming becomes optional. Membership changes go through
+`POST /api/v1/cluster/raft/{add_peer,remove_peer}` (superuser-gated)
+and snapshots can be forced via `POST /api/v1/cluster/raft/snapshot`.
 
 #### A.2 TLS termination in-process — *shipped (rev. May 2026)*
 **Status:** done. Build with `-DDELTA_TLS=ON`; pass `--tls-cert` /
@@ -125,14 +110,60 @@ plain `Server`, and the `HttpServer` route registry is identical. Default
 build stays OpenSSL-free; the same flags on a non-TLS build warn and fall
 back to plain HTTP (so reverse-proxy deployments are unaffected).
 
-#### A.3 Data sharding
-**Status:** single-node store can hold whatever fits on one disk.
-**Plan:** consistent-hash router in front of N independent Delta nodes; the
-collection-engine already namespaces keys by `db:schema:collection`, so the
-shard key can be appended at the prefix level. Cross-shard transactions and
-secondary-index queries are out of scope for v1 of this feature; offline
-re-shard tooling will land alongside.
-**Estimated effort:** ~3 weeks engineering + migration tooling.
+#### A.3 Data sharding — *shipped (rev. May 2026)*
+**Status:** done. Every `delta_server` process belongs to exactly one
+shard (a Raft group from Round 2). Every node knows the full shard map
+and runs a consistent-hash gateway in front of its local engine:
+
+  * `src/cluster/shard_router.hpp` — FNV-1a-64 + SplitMix64 finalizer
+    on a ring with 256 virtual nodes per shard by default (>= 128
+    floor). `route(key)` is stable across processes / restarts and
+    moves only ~1/(N+1) of keys when a shard joins.
+  * Per-document HTTP routing on `POST /collections/{c}/documents`,
+    `POST /documents/bulk`, `GET|PATCH|DELETE /documents/{id}`. Doc ids
+    are allocated by the gateway when absent so routing is
+    deterministic from the first write onward.
+  * Scatter-gather fan-out on `POST /documents/search`,
+    `POST /aggregate`, `POST /count` — gateway merges per-shard
+    responses (concat + re-apply skip/limit; documented caveat:
+    pipelines containing `$group` / `$sort` keep single-shard
+    correctness).
+  * Cross-shard transactions: `POST /transactions/execute` returns
+    HTTP 501 `Status::UNSUPPORTED` with the touched shard ids when ops
+    span multiple shards. Single-shard transactions transparently
+    forward to the owning shard's leader.
+  * Auth trust path: `X-Delta-Cluster-Token` + `X-Delta-Internal-User`
+    headers let one shard delegate an already-validated user identity
+    to another without replicating the session DB.
+  * Collection metadata is broadcast to every peer shard on create so
+    `CREATE COLLECTION` once on the gateway is enough for every shard.
+  * Topology persisted in `delta_system:shards` for backup/restore.
+  * Re-shard tooling: `tools/delta-reshard` walks every collection on
+    every shard, recomputes the owner via the gateway's `route` API,
+    and moves docs that landed on the wrong shard (POST to new owner
+    via gateway + DELETE on old owner direct).
+  * Tests: `test_sharding` (6 unit cases: distribution, stability,
+    minimal disruption, CLI parser, JSON round-trip, vnode clamping)
+    and `test_sharding_chaos` (5-phase multi-process: write, cross-
+    node read, cross-shard tx -> 501, kill-shard survival, route
+    agreement).
+
+Enable per-node:
+
+```
+delta_server \
+  --enable-sharding --shard-id s0 \
+  --shard 's0=n1@host1:16888,n2@host2:16888' \
+  --shard 's1=n3@host3:16888,n4@host4:16888' \
+  --shard-vnodes 256 \
+  --cluster-token <secret> \
+  --port 16888 --data /var/lib/delta/n1
+```
+
+Sharding and raft compose: each shard's peers should also be a Raft
+group (Round 2) so a shard tolerates node loss, and the sharding
+gateway tolerates whole-shard loss only for ops targeting *other*
+shards (an unreachable shard surfaces as 503 to the client).
 
 ### Tier B · SHOULD (target: same quarter)
 

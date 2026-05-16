@@ -1,8 +1,11 @@
 // =============================================================================
-// raft.cpp — leader election + log replication (out-of-line bodies).
+// raft.cpp — leader election + log replication + snapshots + membership.
 //
 // References to the Raft paper (Ongaro & Ousterhout 2014) are inline as
-// "§5.x" / "§9.x" comments at the points they're enforced.
+// "§5.x" / "§7" / "§9.x" comments at the points they're enforced.
+// Round 2 part 3 adds:
+//   * Log compaction via InstallSnapshot (§7)
+//   * Single-server membership change (Raft thesis §4.3): Config log entries.
 // =============================================================================
 #include "raft.hpp"
 
@@ -10,6 +13,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <unistd.h>
 
 namespace delta::network::raft {
@@ -38,13 +42,19 @@ PersistentStorage::State FilePersistentStorage::load() {
                 LogEntry le;
                 le.term    = e.value("term",    (Term)0);
                 le.index   = e.value("index",   (Index)0);
+                le.type    = (LogEntry::Type)e.value("type", (uint8_t)0);
                 le.payload = e.value("payload", std::string());
                 s.log.push_back(std::move(le));
             }
         }
+        s.snapshot_index = j.value("snapshot_index", (Index)0);
+        s.snapshot_term  = j.value("snapshot_term",  (Term)0);
+        s.snapshot_data  = j.value("snapshot_data",  std::string());
+        if (j.contains("peers") && j["peers"].is_array()) {
+            for (auto& p : j["peers"]) s.peers.push_back(p.get<std::string>());
+        }
     } catch (...) {
-        // Treat any parse failure as fresh state. The caller (RaftNode)
-        // will re-derive everything from peers.
+        // Treat any parse failure as fresh state.
         s = State{};
     }
     return s;
@@ -55,12 +65,17 @@ void FilePersistentStorage::save(const State& s) {
     json j = {
         {"current_term", s.current_term},
         {"voted_for",    s.voted_for},
-        {"log",          json::array()}
+        {"log",          json::array()},
+        {"snapshot_index", s.snapshot_index},
+        {"snapshot_term",  s.snapshot_term},
+        {"snapshot_data",  s.snapshot_data},
+        {"peers",          s.peers},
     };
     for (auto& e : s.log) {
         j["log"].push_back({
             {"term",    e.term},
             {"index",   e.index},
+            {"type",    (uint8_t)e.type},
             {"payload", e.payload},
         });
     }
@@ -77,6 +92,30 @@ void FilePersistentStorage::save(const State& s) {
 }
 
 // ---------------------------------------------------------------------------
+// Config payload codec. Trivial CSV of NodeIds; NodeIds must not contain
+// ',' (we reject empty / comma-bearing ids at the membership boundary).
+// ---------------------------------------------------------------------------
+
+std::vector<NodeId> RaftNode::parse_config_payload(const std::string& s) {
+    std::vector<NodeId> out;
+    std::string tok;
+    std::stringstream ss(s);
+    while (std::getline(ss, tok, ',')) {
+        if (!tok.empty()) out.push_back(tok);
+    }
+    return out;
+}
+
+std::string RaftNode::encode_config_payload(const std::vector<NodeId>& peers) {
+    std::string out;
+    for (size_t i = 0; i < peers.size(); ++i) {
+        if (i) out += ",";
+        out += peers[i];
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // RaftNode lifecycle.
 // ---------------------------------------------------------------------------
 
@@ -87,22 +126,54 @@ RaftNode::RaftNode(RaftConfig cfg,
     : cfg_(std::move(cfg)), tx_(std::move(transport)),
       storage_(std::move(storage)), sm_(std::move(sm)),
       rng_(std::random_device{}()) {
-    // Load persistent state.
     auto s = storage_->load();
-    current_term_ = s.current_term;
-    voted_for_    = s.voted_for;
-    log_          = std::move(s.log);
-    // Sentinel at index 0 so that log_.back().index == last log index, and
-    // so that the "previous log entry" of the very first real entry has
-    // term=0 / index=0 (matches what AppendEntries §5.3 expects).
-    if (log_.empty() || log_[0].index != 0 || log_[0].term != 0) {
-        log_.insert(log_.begin(), LogEntry{});
+    current_term_   = s.current_term;
+    voted_for_      = s.voted_for;
+    log_            = std::move(s.log);
+    snapshot_index_ = s.snapshot_index;
+    snapshot_term_  = s.snapshot_term;
+    snapshot_data_  = s.snapshot_data;
+
+    // Peer set bootstrap: persisted peers win if present, otherwise we fall
+    // back to whatever the operator passed in cfg_.peers. This is what lets
+    // a node that was added at runtime survive a restart with its post-
+    // change configuration rather than reverting to its launch-time list.
+    if (!s.peers.empty()) peers_ = s.peers;
+    else                  peers_ = cfg_.peers;
+
+    // Ensure the sentinel matches (snapshot_term_, snapshot_index_). When
+    // we crashed before persisting a log after a snapshot, log_ may already
+    // start at the right index; otherwise we prepend a fresh sentinel.
+    if (log_.empty() || log_[0].index != snapshot_index_ ||
+        log_[0].term != snapshot_term_) {
+        // Drop any stale prefix (entries at or before snapshot_index_) and
+        // splice in the sentinel.
+        std::vector<LogEntry> rebuilt;
+        LogEntry sentinel;
+        sentinel.term  = snapshot_term_;
+        sentinel.index = snapshot_index_;
+        rebuilt.push_back(sentinel);
+        for (auto& e : log_) {
+            if (e.index > snapshot_index_) rebuilt.push_back(e);
+        }
+        log_ = std::move(rebuilt);
+    }
+
+    // commit/apply pointers start AT the snapshot — those entries are
+    // baked into the SM state we'll restore below.
+    commit_index_ = snapshot_index_;
+    last_applied_ = snapshot_index_;
+
+    // Restore SM from snapshot bytes (if any). This must happen BEFORE the
+    // apply loop starts running, so the SM observes snapshot state before
+    // any post-snapshot entries replay through apply().
+    if (!snapshot_data_.empty()) {
+        try { sm_->restore_snapshot(snapshot_data_); }
+        catch (...) { /* SM bugs are SM's */ }
     }
 }
 
-RaftNode::~RaftNode() {
-    stop();
-}
+RaftNode::~RaftNode() { stop(); }
 
 void RaftNode::start() {
     if (running_.exchange(true)) return;
@@ -117,6 +188,7 @@ void RaftNode::start() {
 void RaftNode::stop() {
     if (!running_.exchange(false)) return;
     apply_cv_.notify_all();
+    applied_cv_.notify_all();
     if (tick_thread_.joinable())  tick_thread_.join();
     if (apply_thread_.joinable()) apply_thread_.join();
 }
@@ -147,6 +219,10 @@ Index RaftNode::commit_index() const {
 Index RaftNode::last_log_index() const {
     std::shared_lock<std::shared_mutex> lk(mu_);
     return log_.back().index;
+}
+std::vector<NodeId> RaftNode::peers() const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    return peers_;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +257,7 @@ void RaftNode::become_leader() {
     Index next = log_.back().index + 1;
     next_index_.clear();
     match_index_.clear();
-    for (auto& peer : cfg_.peers) {
+    for (auto& peer : peers_) {
         if (peer == cfg_.node_id) continue;
         next_index_[peer]  = next;
         match_index_[peer] = 0;
@@ -197,10 +273,34 @@ void RaftNode::reset_election_deadline_locked() {
 
 void RaftNode::persist_locked() {
     PersistentStorage::State s;
-    s.current_term = current_term_;
-    s.voted_for    = voted_for_;
-    s.log          = log_;
+    s.current_term   = current_term_;
+    s.voted_for      = voted_for_;
+    s.log            = log_;
+    s.snapshot_index = snapshot_index_;
+    s.snapshot_term  = snapshot_term_;
+    s.snapshot_data  = snapshot_data_;
+    s.peers          = peers_;
     storage_->save(s);
+}
+
+void RaftNode::apply_config_locked(const std::vector<NodeId>& new_peers) {
+    peers_ = new_peers;
+    // Drop next_/match_index entries for peers no longer in the set and
+    // initialise any newly added peers so the next heartbeat starts
+    // catching them up.
+    if (role_ == Role::Leader) {
+        std::unordered_map<NodeId, Index> next_keep, match_keep;
+        Index next = log_.back().index + 1;
+        for (auto& p : peers_) {
+            if (p == cfg_.node_id) continue;
+            auto it_n = next_index_.find(p);
+            next_keep[p]  = it_n != next_index_.end() ? it_n->second : next;
+            auto it_m = match_index_.find(p);
+            match_keep[p] = it_m != match_index_.end() ? it_m->second : 0;
+        }
+        next_index_  = std::move(next_keep);
+        match_index_ = std::move(match_keep);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,25 +330,24 @@ void RaftNode::tick_loop() {
             }
         }
         if (need_election) {
-            // §9.6: try pre-vote first if enabled. If pre-vote loses, we
-            // don't bump our term; we just reset the deadline and wait.
-            if (cfg_.pre_vote) {
-                start_election(/*dry_run=*/true);
-            } else {
-                start_election(/*dry_run=*/false);
-            }
+            if (cfg_.pre_vote) start_election(/*dry_run=*/true);
+            else               start_election(/*dry_run=*/false);
         }
         if (need_heartbeat) {
             broadcast_append_entries();
             last_heartbeat = std::chrono::steady_clock::now();
         }
+        // Opportunistic snapshot: cheap to check, only acts when the
+        // threshold has been crossed.
+        if (cfg_.snapshot_threshold > 0) {
+            maybe_take_snapshot(/*force=*/false);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Election. start_election(dry_run=true) does a pre-vote round (§9.6); on
-// success it falls through into the real election. dry_run=false runs the
-// real RequestVote round, bumping term and recording the self-vote.
+// Election. dry_run=true is §9.6 pre-vote: probe whether a real election
+// would have a chance without bumping current_term.
 // ---------------------------------------------------------------------------
 
 void RaftNode::start_election(bool dry_run) {
@@ -257,31 +356,29 @@ void RaftNode::start_election(bool dry_run) {
     std::vector<NodeId> peers;
     {
         std::unique_lock<std::shared_mutex> lk(mu_);
-        if (role_ == Role::Leader) return;       // someone else won meanwhile
-        if (!dry_run) {
-            become_candidate();                  // bumps term, votes for self
-        } else {
-            // Pre-vote: do NOT bump term, do NOT record voted_for. Just
-            // probe whether a real election would have a chance.
-            reset_election_deadline_locked();
-        }
+        if (role_ == Role::Leader) return;
+        // A node that is no longer in the cluster MUST NOT campaign. This
+        // becomes relevant immediately after a remove-server config commits.
+        bool in_cluster = false;
+        for (auto& p : peers_) if (p == cfg_.node_id) { in_cluster = true; break; }
+        if (!in_cluster) { reset_election_deadline_locked(); return; }
+
+        if (!dry_run) become_candidate();
+        else          reset_election_deadline_locked();
+
         base.term = dry_run ? (current_term_ + 1) : current_term_;
         base.candidate_id   = cfg_.node_id;
         base.last_log_index = log_.back().index;
         base.last_log_term  = log_.back().term;
         base.pre_vote = dry_run;
         self  = cfg_.node_id;
-        peers = cfg_.peers;
+        peers = peers_;
     }
 
-    // Self counts as one yes vote.
-    std::atomic<int> yes{1};
+    std::atomic<int> yes{1};                  // self
     int total_peers = (int)peers.size();
-    int needed = total_peers / 2 + 1;             // strict majority
+    int needed = total_peers / 2 + 1;
 
-    // Fan out vote requests concurrently. Serial dispatch slows the round
-    // by N * rpc_timeout when one peer is dead, which can starve a healthy
-    // election.
     std::vector<std::thread> workers;
     workers.reserve(peers.size());
     std::atomic<bool> stepped_down{false};
@@ -305,27 +402,16 @@ void RaftNode::start_election(bool dry_run) {
     for (auto& w : workers) if (w.joinable()) w.join();
 
     if (stepped_down.load()) return;
-
     if (yes.load() < needed) {
-        // Lost (or tied). Reset deadline and wait for the next election
-        // cycle. The persisted current_term bump (in the non-dry case)
-        // stays — that's how Raft prevents perpetual ties from a single
-        // partitioned node.
         std::unique_lock<std::shared_mutex> lk(mu_);
         reset_election_deadline_locked();
         return;
     }
+    if (dry_run) { start_election(/*dry_run=*/false); return; }
 
-    if (dry_run) {
-        // Pre-vote won. Now fire the real election.
-        start_election(/*dry_run=*/false);
-        return;
-    }
-
-    // Real election won. Become leader and start replicating.
     {
         std::unique_lock<std::shared_mutex> lk(mu_);
-        if (role_ != Role::Candidate) return;     // raced with stepdown
+        if (role_ != Role::Candidate) return;
         become_leader();
     }
     broadcast_append_entries();
@@ -333,7 +419,8 @@ void RaftNode::start_election(bool dry_run) {
 
 // ---------------------------------------------------------------------------
 // Heartbeat / replication: fire one AppendEntries to each peer, with as
-// many entries as it's missing.
+// many entries as it's missing. Falls back to InstallSnapshot when a
+// follower's next_index_ has slid below our snapshot floor.
 // ---------------------------------------------------------------------------
 
 void RaftNode::broadcast_append_entries() {
@@ -343,41 +430,52 @@ void RaftNode::broadcast_append_entries() {
     Index leader_commit;
     std::vector<LogEntry> log_snapshot;
     std::unordered_map<NodeId, Index> next_idx_snapshot;
+    Index snapshot_index_local;
     {
         std::shared_lock<std::shared_mutex> lk(mu_);
         if (role_ != Role::Leader) return;
         self          = cfg_.node_id;
-        peers         = cfg_.peers;
+        peers         = peers_;
         current_term  = current_term_;
         leader_commit = commit_index_;
         log_snapshot  = log_;
         next_idx_snapshot = next_index_;
+        snapshot_index_local = snapshot_index_;
     }
 
-    // Fan out concurrently. A dead peer that takes the full RPC timeout to
-    // fail must NOT slow down delivery to live peers — so each peer gets a
-    // dedicated thread for this round. The threads join before this method
-    // returns to keep ordering simple.
     std::vector<std::thread> workers;
     workers.reserve(peers.size());
     for (auto& peer : peers) {
         if (peer == self) continue;
-        Index ni = 1;
+        Index ni = log_snapshot.front().index + 1;
         auto it = next_idx_snapshot.find(peer);
         if (it != next_idx_snapshot.end()) ni = it->second;
         if (ni < 1) ni = 1;
+
+        // If the follower is so far behind that prev_log_index would point
+        // into the compacted prefix, fall back to InstallSnapshot.
+        if (ni <= snapshot_index_local) {
+            workers.emplace_back([this, peer]() {
+                install_snapshot_to_peer(peer);
+            });
+            continue;
+        }
 
         workers.emplace_back([this, peer, ni, current_term, self,
                               leader_commit, log_snapshot]() mutable {
             AppendEntriesArgs args;
             args.term      = current_term;
             args.leader_id = self;
+            Index first = log_snapshot.front().index;
             Index prev_idx = ni - 1;
-            if (prev_idx >= log_snapshot.size()) prev_idx = log_snapshot.size() - 1;
-            args.prev_log_index = log_snapshot[prev_idx].index;
-            args.prev_log_term  = log_snapshot[prev_idx].term;
-            for (Index i = ni; i < log_snapshot.size(); ++i) {
-                args.entries.push_back(log_snapshot[i]);
+            // prev_idx must be in [first, last] inclusive.
+            if (prev_idx < first) prev_idx = first;
+            if (prev_idx > log_snapshot.back().index) prev_idx = log_snapshot.back().index;
+            const LogEntry& prev = log_snapshot[prev_idx - first];
+            args.prev_log_index = prev.index;
+            args.prev_log_term  = prev.term;
+            for (Index i = ni; i <= log_snapshot.back().index; ++i) {
+                args.entries.push_back(log_snapshot[i - first]);
             }
             args.leader_commit = leader_commit;
 
@@ -386,7 +484,6 @@ void RaftNode::broadcast_append_entries() {
             if (!delivered) return;
 
             std::unique_lock<std::shared_mutex> lk(mu_);
-            // §5.1: a higher term means we've been deposed.
             if (rep.term > current_term_) {
                 become_follower(rep.term, /*leader=*/"");
                 return;
@@ -416,29 +513,45 @@ void RaftNode::broadcast_append_entries() {
 
 void RaftNode::maybe_advance_commit_index_locked() {
     // §5.4.2: only commit entries from the current term directly.
-    // Walk down from last log index; pick the largest N such that:
-    //   * N > commit_index_
-    //   * a majority of match_index_ >= N (counting self trivially)
-    //   * log_[N].term == current_term_
     Index last = log_.back().index;
-    int total_peers = (int)cfg_.peers.size();
+    int total_peers = (int)peers_.size();
+    if (total_peers == 0) return;
     int needed = total_peers / 2 + 1;
+    bool self_in_peers = false;
+    for (auto& pp : peers_) if (pp == cfg_.node_id) { self_in_peers = true; break; }
     for (Index N = last; N > commit_index_; --N) {
-        if (log_[N].term != current_term_) continue;
-        int count = 1;                          // self
-        for (auto& [_, mi] : match_index_) {
-            if (mi >= N) count++;
+        if (N <= snapshot_index_) break;
+        const LogEntry& e = log_at_locked(N);
+        if (e.term != current_term_) continue;
+        int count = 0;
+        // Self automatically has match_index >= log_.back().index >= N.
+        if (self_in_peers) count++;
+        for (auto& [p, mi] : match_index_) {
+            if (p == cfg_.node_id) continue;
+            bool in_set = false;
+            for (auto& pp : peers_) if (pp == p) { in_set = true; break; }
+            if (in_set && mi >= N) count++;
         }
         if (count >= needed) {
             commit_index_ = N;
             apply_cv_.notify_all();
+            // If a Config entry just committed and we removed ourselves
+            // from the peer set, step down now — we have no business
+            // continuing to lead.
+            if (e.type == LogEntry::Config && !self_in_peers) {
+                role_ = Role::Follower;
+                leader_id_.clear();
+                next_index_.clear();
+                match_index_.clear();
+                reset_election_deadline_locked();
+            }
             break;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Apply loop. Drains [last_applied_+1 .. commit_index_] in order.
+// Apply loop.
 // ---------------------------------------------------------------------------
 
 void RaftNode::apply_loop() {
@@ -449,14 +562,34 @@ void RaftNode::apply_loop() {
         });
         if (!running_.load()) return;
         while (commit_index_ > last_applied_) {
-            last_applied_++;
-            // Copy the entry while holding the lock, drop the lock for the
-            // SM call (apply must be allowed to be slow without blocking
-            // RPC handling).
-            LogEntry e = log_[last_applied_];
+            // If an InstallSnapshot jumped commit_index_ past our log
+            // window, advance last_applied_ to snapshot_index_ in one step.
+            if (last_applied_ < snapshot_index_) {
+                last_applied_ = snapshot_index_;
+                applied_cv_.notify_all();
+                continue;
+            }
+            Index next = last_applied_ + 1;
+            if (!has_log_index_locked(next)) {
+                // Race-narrow: snapshot installed mid-loop. Skip ahead.
+                last_applied_ = std::max(next, snapshot_index_);
+                applied_cv_.notify_all();
+                continue;
+            }
+            LogEntry e = log_at_locked(next);
             lk.unlock();
-            try { sm_->apply(e); } catch (...) { /* SM bugs are SM's */ }
+            if (e.type == LogEntry::Normal) {
+                try { sm_->apply(e); } catch (...) { /* SM bugs are SM's */ }
+            }
+            // Config entries: state machine is not involved.
             lk.lock();
+            // IMPORTANT: bump last_applied_ AFTER the SM has finished
+            // applying. wait_applied is meant to be a tighter contract
+            // than wait_commit: when it returns, the SM has observed the
+            // entry. Bumping before would race the LSM proposer's
+            // post-put visibility check.
+            last_applied_ = next;
+            applied_cv_.notify_all();
         }
     }
 }
@@ -471,12 +604,8 @@ void RaftNode::handle_request_vote(const RequestVoteArgs& args,
     reply->term = current_term_;
     reply->vote_granted = false;
 
-    // §9.6 pre-vote: same checks as a real RequestVote, but never persists
-    // a vote and never bumps current_term. The point is to fail fast in a
-    // partitioned minority without disrupting a healthy leader.
     if (args.pre_vote) {
         if (args.term < current_term_) return;
-        // up-to-date check (§5.4.1).
         Term  my_last_term  = log_.back().term;
         Index my_last_index = log_.back().index;
         bool log_ok = (args.last_log_term > my_last_term) ||
@@ -486,7 +615,6 @@ void RaftNode::handle_request_vote(const RequestVoteArgs& args,
         return;
     }
 
-    // Real RequestVote.
     if (args.term < current_term_) return;
     if (args.term > current_term_) {
         become_follower(args.term, /*leader=*/"");
@@ -514,9 +642,7 @@ void RaftNode::handle_append_entries(const AppendEntriesArgs& args,
     reply->conflict_index = 0;
     reply->conflict_term  = 0;
 
-    // §5.1 stale-term reject.
     if (args.term < current_term_) return;
-    // Higher-or-equal term: step down (idempotent if already follower).
     if (args.term > current_term_ || role_ != Role::Follower) {
         become_follower(args.term, args.leader_id);
     } else {
@@ -525,38 +651,86 @@ void RaftNode::handle_append_entries(const AppendEntriesArgs& args,
     reply->term = current_term_;
     reset_election_deadline_locked();
 
-    // §5.3 consistency check: prev_log_* must match what we have.
-    if (args.prev_log_index >= log_.size()) {
+    // §5.3 consistency check, with snapshot-aware adjustment. If the
+    // leader's prev_log_index lies in our compacted prefix, we cannot
+    // verify the match — accept whatever entries strictly follow our
+    // snapshot and treat the rest as a no-op.
+    if (args.prev_log_index < log_.front().index) {
+        // The leader is replaying entries we've already snapshotted.
+        // Find the first entry at or after our snapshot frontier and
+        // splice the rest in.
+        Index first_keep = log_.front().index + 1;
+        size_t skip = 0;
+        for (; skip < args.entries.size(); ++skip) {
+            if (args.entries[skip].index >= first_keep) break;
+        }
+        // After the skip, we proceed exactly as if prev_log_index was the
+        // sentinel and entries[skip..] are what we ought to append.
+        // Splice in:
+        Index write_at = first_keep;
+        for (size_t i = skip; i < args.entries.size(); ++i, ++write_at) {
+            if (has_log_index_locked(write_at)) {
+                if (log_at_locked(write_at).term != args.entries[i].term) {
+                    // Truncate to write_at-1.
+                    log_.resize(write_at - log_.front().index);
+                    log_.push_back(args.entries[i]);
+                    if (args.entries[i].type == LogEntry::Config) {
+                        apply_config_locked(parse_config_payload(args.entries[i].payload));
+                    }
+                }
+            } else {
+                log_.push_back(args.entries[i]);
+                if (args.entries[i].type == LogEntry::Config) {
+                    apply_config_locked(parse_config_payload(args.entries[i].payload));
+                }
+            }
+        }
+        persist_locked();
+        Index last_new = args.prev_log_index + (Index)args.entries.size();
+        Index new_ci = std::min<Index>(args.leader_commit, last_new);
+        if (new_ci > commit_index_) {
+            commit_index_ = new_ci;
+            apply_cv_.notify_all();
+        }
+        reply->success = true;
+        return;
+    }
+    if (!has_log_index_locked(args.prev_log_index)) {
         reply->conflict_index = log_.back().index + 1;
         return;
     }
-    if (log_[args.prev_log_index].term != args.prev_log_term) {
-        // Tell the leader the first index of our conflicting term so it
-        // can rewind faster than -1 per round.
-        Term bad_term = log_[args.prev_log_index].term;
+    if (log_at_locked(args.prev_log_index).term != args.prev_log_term) {
+        Term bad_term = log_at_locked(args.prev_log_index).term;
         Index first = args.prev_log_index;
-        while (first > 1 && log_[first - 1].term == bad_term) first--;
+        while (first > log_.front().index + 1 &&
+               log_at_locked(first - 1).term == bad_term) {
+            first--;
+        }
         reply->conflict_index = first;
         reply->conflict_term  = bad_term;
         return;
     }
 
-    // Append / overwrite entries. §5.3: existing entries that conflict
-    // with new ones are deleted along with everything after them.
+    // Append / overwrite.
     Index write_at = args.prev_log_index + 1;
     for (size_t i = 0; i < args.entries.size(); ++i, ++write_at) {
-        if (write_at < log_.size()) {
-            if (log_[write_at].term != args.entries[i].term) {
-                log_.resize(write_at);
+        if (has_log_index_locked(write_at)) {
+            if (log_at_locked(write_at).term != args.entries[i].term) {
+                log_.resize(write_at - log_.front().index);
                 log_.push_back(args.entries[i]);
-            } // else: same entry already present, skip
+                if (args.entries[i].type == LogEntry::Config) {
+                    apply_config_locked(parse_config_payload(args.entries[i].payload));
+                }
+            } // else: identical, leave in place.
         } else {
             log_.push_back(args.entries[i]);
+            if (args.entries[i].type == LogEntry::Config) {
+                apply_config_locked(parse_config_payload(args.entries[i].payload));
+            }
         }
     }
     persist_locked();
 
-    // §5.3 commit advance. min(leader_commit, last new index in this RPC).
     Index last_new = args.prev_log_index + (Index)args.entries.size();
     Index new_ci = std::min<Index>(args.leader_commit, last_new);
     if (new_ci > commit_index_) {
@@ -564,6 +738,52 @@ void RaftNode::handle_append_entries(const AppendEntriesArgs& args,
         apply_cv_.notify_all();
     }
     reply->success = true;
+}
+
+void RaftNode::handle_install_snapshot(const InstallSnapshotArgs& args,
+                                       InstallSnapshotReply* reply) {
+    std::unique_lock<std::shared_mutex> lk(mu_);
+    reply->term = current_term_;
+    if (args.term < current_term_) return;
+    if (args.term > current_term_ || role_ != Role::Follower) {
+        become_follower(args.term, args.leader_id);
+    } else {
+        leader_id_ = args.leader_id;
+    }
+    reply->term = current_term_;
+    reset_election_deadline_locked();
+
+    // Stale or already-incorporated snapshot? No-op.
+    if (args.last_included_index <= snapshot_index_) return;
+
+    // Restore SM. We drop the lock during the SM call to avoid stalling
+    // any in-flight handle_request_vote — the SM can be slow for big
+    // snapshots.
+    std::string data = args.data;
+    lk.unlock();
+    try { sm_->restore_snapshot(data); } catch (...) {}
+    lk.lock();
+
+    // Truncate log. Keep entries strictly after last_included_index.
+    std::vector<LogEntry> kept;
+    LogEntry sentinel;
+    sentinel.term  = args.last_included_term;
+    sentinel.index = args.last_included_index;
+    kept.push_back(sentinel);
+    for (auto& e : log_) {
+        if (e.index > args.last_included_index) kept.push_back(e);
+    }
+    log_ = std::move(kept);
+
+    snapshot_index_ = args.last_included_index;
+    snapshot_term_  = args.last_included_term;
+    snapshot_data_  = std::move(data);
+    if (commit_index_ < snapshot_index_) commit_index_ = snapshot_index_;
+    if (last_applied_ < snapshot_index_) last_applied_ = snapshot_index_;
+    if (!args.peers.empty()) apply_config_locked(args.peers);
+    persist_locked();
+    apply_cv_.notify_all();
+    applied_cv_.notify_all();
 }
 
 // ---------------------------------------------------------------------------
@@ -581,13 +801,45 @@ bool RaftNode::propose(const std::string& payload, Index* out_index,
         LogEntry e;
         e.term    = current_term_;
         e.index   = log_.back().index + 1;
+        e.type    = LogEntry::Normal;
         e.payload = payload;
         log_.push_back(e);
         match_index_[cfg_.node_id] = e.index;
         persist_locked();
         if (out_index) *out_index = e.index;
     }
-    // Kick off replication immediately.
+    broadcast_append_entries();
+    return true;
+}
+
+bool RaftNode::propose_config_change(const std::vector<NodeId>& new_peers,
+                                     Index* out_index,
+                                     NodeId* out_leader_hint) {
+    {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        if (role_ != Role::Leader) {
+            if (out_leader_hint) *out_leader_hint = leader_id_;
+            return false;
+        }
+        // Reject if a previous config change has not yet committed.
+        if (pending_config_index_ > commit_index_) return false;
+        if (new_peers.empty()) return false;
+        // Reject malformed ids (would break our CSV encoding).
+        for (auto& p : new_peers) {
+            if (p.empty() || p.find(',') != std::string::npos) return false;
+        }
+        LogEntry e;
+        e.term    = current_term_;
+        e.index   = log_.back().index + 1;
+        e.type    = LogEntry::Config;
+        e.payload = encode_config_payload(new_peers);
+        log_.push_back(e);
+        match_index_[cfg_.node_id] = e.index;
+        pending_config_index_ = e.index;
+        apply_config_locked(new_peers);   // takes effect on APPEND, §4.3.
+        persist_locked();
+        if (out_index) *out_index = e.index;
+    }
     broadcast_append_entries();
     return true;
 }
@@ -601,6 +853,98 @@ bool RaftNode::wait_commit(Index target_index,
             return commit_index_ >= target_index;
         }
     }
+    return true;
+}
+
+bool RaftNode::wait_applied(Index target_index,
+                            std::chrono::milliseconds timeout) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::shared_mutex> lk(mu_);
+    while (last_applied_ < target_index) {
+        if (applied_cv_.wait_until(lk, deadline) == std::cv_status::timeout) {
+            return last_applied_ >= target_index;
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshotting.
+// ---------------------------------------------------------------------------
+
+Index RaftNode::maybe_take_snapshot(bool force) {
+    Index target_idx;
+    Term  target_term;
+    std::vector<NodeId> peers_snapshot;
+    {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        if (!force && cfg_.snapshot_threshold <= 0) return 0;
+        if (last_applied_ <= snapshot_index_) return 0;
+        Index lag = last_applied_ - snapshot_index_;
+        if (!force && (int)lag < cfg_.snapshot_threshold) return 0;
+        target_idx  = last_applied_;
+        // last_applied_ must be in log_ (by apply_loop invariant).
+        if (!has_log_index_locked(target_idx)) return 0;
+        target_term = log_at_locked(target_idx).term;
+        peers_snapshot = peers_;
+    }
+    // Drop the lock for take_snapshot — the SM call can be slow.
+    std::string data;
+    try { sm_->take_snapshot(&data); } catch (...) { return 0; }
+    {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        // Re-check: another path could have snapshotted while we were out.
+        if (target_idx <= snapshot_index_) return snapshot_index_;
+        // Truncate log: keep entries strictly after target_idx, with new
+        // sentinel = (target_term, target_idx).
+        std::vector<LogEntry> kept;
+        LogEntry sentinel;
+        sentinel.term  = target_term;
+        sentinel.index = target_idx;
+        kept.push_back(sentinel);
+        for (auto& e : log_) {
+            if (e.index > target_idx) kept.push_back(e);
+        }
+        log_ = std::move(kept);
+        snapshot_index_ = target_idx;
+        snapshot_term_  = target_term;
+        snapshot_data_  = std::move(data);
+        // peers_ stays as-is; the snapshot carries the post-change set.
+        persist_locked();
+    }
+    return target_idx;
+}
+
+Index RaftNode::snapshot_now() { return maybe_take_snapshot(/*force=*/true); }
+
+bool RaftNode::install_snapshot_to_peer(const NodeId& peer) {
+    InstallSnapshotArgs args;
+    Term current_term;
+    {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        if (role_ != Role::Leader) return false;
+        args.term                = current_term_;
+        args.leader_id           = cfg_.node_id;
+        args.last_included_index = snapshot_index_;
+        args.last_included_term  = snapshot_term_;
+        args.data                = snapshot_data_;
+        args.peers               = peers_;
+        current_term             = current_term_;
+    }
+    InstallSnapshotReply rep;
+    bool delivered = tx_->send_install_snapshot(peer, args, &rep);
+    if (!delivered) return false;
+
+    std::unique_lock<std::shared_mutex> lk(mu_);
+    if (rep.term > current_term_) {
+        become_follower(rep.term, /*leader=*/"");
+        return false;
+    }
+    if (role_ != Role::Leader || current_term_ != current_term) return false;
+    Index ack = args.last_included_index;
+    if (ack > match_index_[peer]) match_index_[peer] = ack;
+    next_index_[peer] = ack + 1;
+    maybe_advance_commit_index_locked();
     return true;
 }
 

@@ -747,6 +747,10 @@ the same way you would an HTTP error response.
 
 ## 14 · Replication / cluster
 
+Delta supports two replication modes; pick exactly one per cluster.
+
+### 14.1 · Legacy master/replica streaming (single writer)
+
 ```
 GET  /api/v1/cluster/info                role, lsn, master_url, replicas[]
 GET  /api/v1/cluster/changes?since=N     WAL changes since LSN
@@ -760,6 +764,125 @@ Boot a replica:
 ```bash
 delta_server --role replica --master-url http://master:16888 --cluster-token <secret> ...
 ```
+
+Failover is manual: a human (or an external orchestrator) hits
+`/cluster/promote` on the chosen replica.
+
+### 14.2 · Raft consensus (automatic failover)
+
+When `--enable-raft` is set on every node, every `put / del` on the
+leader is synchronously replicated through Raft; an HTTP `200` from a
+mutating endpoint means the write is on a majority AND visible locally.
+Followers reject writes with `503 raft: not leader` so clients are
+expected to retry against the current leader (see
+`GET /api/v1/cluster/raft/status → data.leader_id`).
+
+Boot a three-node cluster (one shell per node, swap `--node-id`):
+
+```bash
+delta_server \
+  --enable-raft --node-id n1 \
+  --cluster-peer n1@host1:16888 \
+  --cluster-peer n2@host2:16888 \
+  --cluster-peer n3@host3:16888 \
+  --cluster-token <secret> \
+  --port 16888 --data /var/lib/delta/n1
+```
+
+Tunables (CLI or JSON):
+
+```
+--raft-election-min-ms       (default 200)
+--raft-election-max-ms       (default 400)
+--raft-heartbeat-ms          (default 50)
+--raft-tick-ms               (default 20)
+--raft-snapshot-threshold N  (default 10000 committed entries; 0 = off)
+--raft-propose-timeout-ms N  (default 5000)
+--raft-no-pre-vote           (disable §9.6 pre-vote; debug only)
+```
+
+Endpoints:
+
+```
+POST /api/v1/cluster/raft/vote               (peer-to-peer, token-gated)
+POST /api/v1/cluster/raft/append             (peer-to-peer, token-gated)
+POST /api/v1/cluster/raft/install_snapshot   (peer-to-peer, token-gated)
+GET  /api/v1/cluster/raft/status             role, term, leader_id, peers[], commit_index
+POST /api/v1/cluster/raft/propose            opaque payload — for tests
+POST /api/v1/cluster/raft/snapshot           force a snapshot now (superuser)
+POST /api/v1/cluster/raft/add_peer           { "peer_id": "n4" }     (superuser)
+POST /api/v1/cluster/raft/remove_peer        { "peer_id": "n3" }     (superuser)
+```
+
+Membership uses the simpler single-server change (Raft thesis §4.3) —
+one add or remove at a time, the new peer set takes effect on append,
+and the leader refuses overlapping changes.
+
+### 14.3 · Sharding (horizontal scale-out)
+
+Each `delta_server` process belongs to exactly ONE shard. Every node
+runs a consistent-hash gateway that knows the full shard map and
+routes document operations to the owning shard. Sharding and Raft
+compose: inside one shard, run raft for replication; across shards,
+the gateway hashes by document id.
+
+Boot two shards × one node (one shell per node, swap `--shard-id`):
+
+```bash
+delta_server \
+  --enable-sharding --shard-id s0 \
+  --shard 's0=n1@host1:16888' \
+  --shard 's1=n2@host2:16888' \
+  --cluster-token <secret> \
+  --port 16888 --data /var/lib/delta/n1
+```
+
+For a fault-tolerant deployment, each shard SHOULD be a 3-node Raft
+group (combine `--enable-raft` + `--enable-sharding` on the same
+process; the gateway routes between shards, Raft replicates within a
+shard).
+
+Tunables:
+
+```
+--shard-vnodes N          virtual nodes per shard (default 256, min 128)
+--shard-rpc-timeout-ms N  per-inter-shard call deadline (default 2500)
+```
+
+Endpoints:
+
+```
+GET  /api/v1/cluster/shards                     introspection
+GET  /api/v1/cluster/shards/route?key=<id>      where does <id> live?
+```
+
+Routing semantics:
+
+  * **Point ops** (`POST /collections/{c}/documents`,
+    `GET|PATCH|DELETE /collections/{c}/documents/{id}`,
+    `POST /collections/{c}/documents/bulk`) — gateway computes
+    `route(_id)` and forwards to the owning shard's first peer. Doc
+    ids are allocated by the gateway when missing so routing is stable
+    from the first write.
+  * **Fan-out reads** (`POST /collections/{c}/documents/search`,
+    `POST /collections/{c}/count`, `POST /collections/{c}/aggregate`) —
+    gateway scatters to every shard in parallel and concatenates +
+    re-applies skip/limit on the merged result. NOTE: pipelines that
+    rely on `$group` or `$sort` for global correctness should keep
+    their data on a single shard.
+  * **Cross-shard transactions** (`POST /transactions/execute`) — if
+    ops span multiple shards the gateway returns HTTP 501 with
+    `{"code": 501, "message": "cross-shard transactions are not
+    supported in this release", "data": {"shards": [...]}}`. Single-
+    shard transactions transparently forward.
+  * **Collection metadata** (`POST /api/v1/collections`) is
+    automatically broadcast to every peer shard so each shard holds
+    a full copy of the schema. Create once on any gateway.
+
+Re-balancing after a topology change: run
+`tools/delta-reshard --gateway <url> --shard <url1> --shard <url2>`.
+It walks every collection, recomputes ownership under the new
+topology, and moves docs that landed on the wrong shard.
 
 ---
 

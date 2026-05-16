@@ -14,7 +14,11 @@ namespace delta {
 using json = nlohmann::json;
 
 struct Status {
-    enum Code { OK = 0, ERROR = 1, NOT_FOUND = 2, DUPLICATE = 3, INVALID = 4, UNAUTHORIZED = 5, FORBIDDEN = 6, INTERNAL = 7, CONFLICT = 8 };
+    // Code 501 lines up with HTTP semantics so the gateway can pass it
+    // through verbatim (Round 3: cross-shard transactions surface this).
+    enum Code { OK = 0, ERROR = 1, NOT_FOUND = 2, DUPLICATE = 3, INVALID = 4,
+                UNAUTHORIZED = 5, FORBIDDEN = 6, INTERNAL = 7, CONFLICT = 8,
+                UNSUPPORTED = 501 };
     Code code = OK;
     std::string message;
     Status() = default;
@@ -29,6 +33,7 @@ struct Status {
     // P1-6: optimistic-locking version mismatch / lost-update.
     static Status Conflict(const std::string& m = "conflict") { return Status(CONFLICT, m); }
     static Status Error(const std::string& m) { return Status(ERROR, m); }
+    static Status Unsupported(const std::string& m = "unsupported") { return Status(UNSUPPORTED, m); }
 };
 
 inline uint64_t now_ms() {

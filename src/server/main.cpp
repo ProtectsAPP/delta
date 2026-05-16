@@ -11,6 +11,10 @@
 #include "../network/http_server.hpp"
 #include "../network/deltaql_server.hpp"
 #include "../network/ws_server.hpp"
+#include "../network/raft.hpp"
+#include "../network/raft_http_transport.hpp"
+#include "../network/raft_lsm_sm.hpp"
+#include "../cluster/shard_router.hpp"
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -172,6 +176,145 @@ int main(int argc, char** argv) {
             << std::endl;
     }
 
+    // ---------------------------------------------------------------------
+    // Raft consensus (Round 2 part 3). When --enable-raft, the LSMTree
+    // write path is routed through a RaftNode; the legacy ReplicationManager
+    // stays inert (Standalone) but its cluster_token is reused for the
+    // /api/v1/cluster/raft/* token gate so operators can use one shared
+    // secret.
+    // ---------------------------------------------------------------------
+    std::unique_ptr<network::raft::RaftNode>          raft_node;
+    std::shared_ptr<network::raft::HttpRaftTransport> raft_tx;
+    std::shared_ptr<network::raft::FilePersistentStorage> raft_storage;
+    std::shared_ptr<network::raft::LsmRaftStateMachine>   raft_sm;
+    if (cfg.enable_raft) {
+        if (cfg.node_id.empty()) {
+            std::cerr << "[Delta] --enable-raft requires --node-id\n";
+            return 1;
+        }
+        if (cfg.cluster_peers.empty()) {
+            std::cerr << "[Delta] --enable-raft requires at least one --cluster-peer\n";
+            return 1;
+        }
+        // Parse peer specs and ensure self is listed.
+        std::unordered_map<std::string, std::string> peer_urls;
+        std::vector<std::string> peer_ids;
+        bool self_seen = false;
+        for (auto& raw : cfg.cluster_peers) {
+            auto p = server::ServerConfig::parse_peer_spec(raw);
+            if (!p.valid()) {
+                std::cerr << "[Delta] malformed --cluster-peer: " << raw
+                          << " (expected id@host:port)\n";
+                return 1;
+            }
+            if (p.id == cfg.node_id) { self_seen = true; continue; }
+            peer_urls[p.id] = p.base_url();
+            peer_ids.push_back(p.id);
+        }
+        peer_ids.push_back(cfg.node_id);   // include self in peer set
+        if (!self_seen) {
+            std::cerr << "[Delta] --node-id=" << cfg.node_id
+                      << " must appear in --cluster-peer list\n";
+            return 1;
+        }
+
+        std::filesystem::create_directories(cfg.data_dir + "/raft");
+        raft_storage = std::make_shared<network::raft::FilePersistentStorage>(
+            cfg.data_dir + "/raft/state.json");
+        raft_sm = std::make_shared<network::raft::LsmRaftStateMachine>(store.get());
+        raft_tx = std::make_shared<network::raft::HttpRaftTransport>(
+            peer_urls, cfg.cluster_token,
+            /*rpc_timeout_ms=*/std::max(cfg.raft_heartbeat_ms * 2, 100));
+
+        network::raft::RaftConfig rcfg;
+        rcfg.node_id            = cfg.node_id;
+        rcfg.peers              = peer_ids;
+        rcfg.election_min_ms    = cfg.raft_election_min_ms;
+        rcfg.election_max_ms    = cfg.raft_election_max_ms;
+        rcfg.heartbeat_ms       = cfg.raft_heartbeat_ms;
+        rcfg.tick_ms            = cfg.raft_tick_ms;
+        rcfg.pre_vote           = cfg.raft_pre_vote;
+        rcfg.snapshot_threshold = cfg.raft_snapshot_threshold;
+        raft_node = std::make_unique<network::raft::RaftNode>(
+            rcfg, raft_tx, raft_storage, raft_sm);
+
+        // Plug the proposer into the LSMTree write path. The synchronous
+        // wait_applied ensures the local replica has actually written the
+        // value before put() returns, so a follow-up get() on the same
+        // node sees it.
+        auto* rn = raft_node.get();
+        auto timeout = std::chrono::milliseconds(cfg.raft_propose_timeout_ms);
+        store->set_raft_proposer([rn, timeout](const std::string& k,
+                                                const std::string& v,
+                                                bool tomb) -> bool {
+            std::string payload = network::raft::LsmWriteCodec::encode(k, v, tomb);
+            network::raft::Index idx = 0;
+            network::raft::NodeId hint;
+            if (!rn->propose(payload, &idx, &hint)) return false;
+            if (!rn->wait_applied(idx, timeout)) return false;
+            return true;
+        });
+
+        server.set_raft(rn);
+        Logger::instance().info("raft_enabled",
+            json{{"node_id", cfg.node_id},
+                 {"peers", peer_ids},
+                 {"snapshot_threshold", cfg.raft_snapshot_threshold}});
+        rn->start();
+        std::cout << "[Delta] raft enabled: node_id=" << cfg.node_id
+                  << " peers=" << peer_ids.size() << std::endl;
+    }
+
+    // ---------------------------------------------------------------------
+    // Sharding gateway (Round 3). When --enable-sharding is set the HTTP
+    // listener installs a pre-routing prefilter that consistent-hashes
+    // document operations across the configured shards. Inside this shard
+    // we still use raft for replication; the gateway is orthogonal.
+    // ---------------------------------------------------------------------
+    if (cfg.enable_sharding) {
+        if (cfg.shard_id.empty()) {
+            std::cerr << "[Delta] --enable-sharding requires --shard-id\n";
+            return 1;
+        }
+        if (cfg.shards.empty()) {
+            std::cerr << "[Delta] --enable-sharding requires at least one --shard\n";
+            return 1;
+        }
+        std::vector<cluster::ShardSpec> parsed;
+        bool found_self = false;
+        for (auto& raw : cfg.shards) {
+            auto s = cluster::ShardMap::parse_cli_spec(raw);
+            if (!s.valid()) {
+                std::cerr << "[Delta] malformed --shard spec: " << raw
+                          << " (expected shard_id=id@host:port,id@host:port)\n";
+                return 1;
+            }
+            if (s.id == cfg.shard_id) found_self = true;
+            parsed.push_back(std::move(s));
+        }
+        if (!found_self) {
+            std::cerr << "[Delta] --shard-id=" << cfg.shard_id
+                      << " not present in --shard specs\n";
+            return 1;
+        }
+        cluster::ShardMap m(std::move(parsed), cfg.shard_vnodes);
+        server.set_sharding(m, cfg.shard_id, cfg.cluster_token,
+                            cfg.shard_rpc_timeout_ms);
+        // Persist the topology snapshot in delta_system.shards so a
+        // backup/restore captures it. Round 3 doesn't yet auto-replicate
+        // topology changes via raft — operators bounce nodes with the
+        // updated --shard list. The persisted record is informational.
+        store->apply_replicated(0, "delta_system:shards",
+            m.to_json().dump(), false);
+        Logger::instance().info("sharding_enabled",
+            json{{"shard_id", cfg.shard_id},
+                 {"shard_count", m.shard_count()},
+                 {"vnodes_per_shard", m.vnodes()}});
+        std::cout << "[Delta] sharding enabled: shard_id=" << cfg.shard_id
+                  << " total_shards=" << m.shard_count()
+                  << " vnodes=" << m.vnodes() << std::endl;
+    }
+
     std::signal(SIGINT, on_sig);
     std::signal(SIGTERM, on_sig);
 
@@ -210,6 +353,7 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     std::cerr << "[Delta] shutdown signal received, stopping..." << std::endl;
+    if (raft_node) raft_node->stop();
     if (dql) dql->stop();
     if (wss) wss->stop();
     server.stop();
