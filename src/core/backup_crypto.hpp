@@ -44,7 +44,19 @@
 
 namespace delta::backup_crypto {
 
+// P1-14: use the shared CSPRNG (csprng_bytes in common.hpp) so the
+// 12-byte CTR nonce is drawn from /dev/urandom rather than an unseeded
+// random_device fallback. Combined with the 96-bit space this gives a
+// collision-resistant nonce without an explicit counter.
 inline std::vector<uint8_t> random_bytes(size_t n) {
+    std::vector<uint8_t> out(n);
+    delta::csprng_bytes(out.data(), n);
+    return out;
+}
+
+// Original implementation, kept as the unreachable suffix below to
+// preserve git diffs; will be cleaned up in a follow-up.
+inline std::vector<uint8_t> random_bytes_legacy(size_t n) {
     std::vector<uint8_t> out(n);
     std::random_device rd;
     for (size_t i = 0; i < n; ++i) out[i] = (uint8_t)(rd() & 0xFF);

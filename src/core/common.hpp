@@ -7,6 +7,8 @@
 #include <iomanip>
 #include <mutex>
 #include <atomic>
+#include <cstdio>
+#include <cstdint>
 #include "json.hpp"
 
 namespace delta {
@@ -43,11 +45,31 @@ inline uint64_t now_ms() {
 
 inline uint64_t now_sec() { return now_ms() / 1000; }
 
+// P2-01 / P2-11: cryptographically secure random bytes. Backed by
+// /dev/urandom (POSIX). We read in chunks; if the read fails for any
+// reason we fall back to std::random_device which on Linux/macOS is
+// also a CSPRNG.
+inline void csprng_bytes(uint8_t* out, size_t n) {
+    static thread_local FILE* fp = std::fopen("/dev/urandom", "rb");
+    if (fp) {
+        size_t got = std::fread(out, 1, n, fp);
+        if (got == n) return;
+        // partial read: top up with random_device
+        for (size_t i = got; i < n; ++i) {
+            static thread_local std::random_device rd;
+            out[i] = (uint8_t)(rd() & 0xFF);
+        }
+        return;
+    }
+    static thread_local std::random_device rd;
+    for (size_t i = 0; i < n; ++i) out[i] = (uint8_t)(rd() & 0xFF);
+}
+
 inline std::string gen_id() {
     static std::atomic<uint64_t> counter{0};
-    static std::mt19937_64 rng(std::random_device{}());
     uint64_t ts = now_ms();
-    uint64_t r = rng();
+    uint8_t rnd[6]; csprng_bytes(rnd, 6);
+    uint64_t r = 0; for (int i = 0; i < 6; ++i) r = (r << 8) | rnd[i];
     uint64_t c = counter.fetch_add(1);
     std::stringstream ss;
     ss << std::hex << std::setw(12) << std::setfill('0') << ts
@@ -57,10 +79,11 @@ inline std::string gen_id() {
 }
 
 inline std::string random_hex(size_t bytes) {
-    static thread_local std::mt19937_64 rng(std::random_device{}());
+    std::vector<uint8_t> buf(bytes);
+    csprng_bytes(buf.data(), bytes);
     std::stringstream ss;
     for (size_t i = 0; i < bytes; ++i) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << (rng() & 0xFF);
+        ss << std::hex << std::setw(2) << std::setfill('0') << (unsigned)buf[i];
     }
     return ss.str();
 }

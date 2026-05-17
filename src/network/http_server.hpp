@@ -8,6 +8,7 @@
 #include "../cache/cache_engine.hpp"
 #include "../vector/hnsw_index.hpp"
 #include "../auth/auth_manager.hpp"
+#include "../auth/password.hpp"
 #include "../database/database_manager.hpp"
 #include "connection_pool.hpp"
 #include "replication.hpp"
@@ -263,8 +264,10 @@ private:
         srv_.set_write_timeout(30, 0);
         srv_.set_idle_interval(0, 200000); // 200ms idle scan
 
-        // Cap payload at 64MB; refuses gigantic uploads early.
-        srv_.set_payload_max_length(64 * 1024 * 1024);
+        // P1-17: cap payload at 16 MiB (was 64 MiB). The DB has no
+        // single-document use case that needs more, and lowering it
+        // shuts down body-size based memory exhaustion attempts.
+        srv_.set_payload_max_length(16 * 1024 * 1024);
 
         // Larger TCP listen backlog — under burst, the kernel queue must hold
         // many half-opened connections before the server thread accept()s them.
@@ -290,9 +293,12 @@ private:
             req_start_ms_slot() = (double)now_ms();
             // Per-IP token-bucket rate limit. Disabled by default; turned on
             // by main.cpp via set_conn_rate_limit().
-            if (!ip_rate_allow(req.remote_addr)) {
+            // P1-10: rate limit on the *client* IP, not the (possibly
+            // shared) proxy IP.
+            std::string cip = client_ip(req);
+            if (!ip_rate_allow(cip)) {
                 Logger::instance().audit("rate_limited",
-                    {{"ip", req.remote_addr}, {"path", req.path}, {"method", req.method}});
+                    {{"ip", cip}, {"path", req.path}, {"method", req.method}});
                 send_json(res, Status::FORBIDDEN,
                           json{{"message", "rate limit exceeded"}, {"data", nullptr}});
                 Logger::clear_trace_id();
@@ -449,6 +455,11 @@ public:
     CorsPolicy cors_;
     // P1-17: per (ip|user) sliding-window login rate limiter.
     auth::LoginRateLimiter login_limiter_;
+    // P1-10: set of trusted proxy IPs whose X-Forwarded-For we honour.
+    std::set<std::string> trusted_proxies_;
+public:
+    void set_trusted_proxies(std::set<std::string> ips) { trusted_proxies_ = std::move(ips); }
+private:
 
 private:
     storage::LSMTree* store_;
@@ -463,6 +474,11 @@ private:
     raft::RaftNode* raft_ = nullptr;
 
     // Round 3 sharding state. shard_map_ being empty disables the gateway.
+    // P0-12: shared_mutex guards future runtime swaps of the topology.
+    // set_sharding() is currently call-once before listen(), but the
+    // primitive is here as defense-in-depth so a follow-up that adds
+    // online reshard cannot race with in-flight requests.
+    mutable std::shared_mutex shard_map_mu_;
     cluster::ShardMap shard_map_;
     std::string       local_shard_;
     std::string       shard_token_;
@@ -512,19 +528,60 @@ private:
         // see the request, so the per-request handler still has to call
         // apply_cors() — but we keep the legacy headers here as a fallback
         // for cross-origin tools that hit a JSON endpoint directly.
-        if (cors_.origins.empty()) {
-            res.set_header("Access-Control-Allow-Origin", "*");
-            res.set_header("Access-Control-Allow-Headers", "*");
-            res.set_header("Access-Control-Allow-Methods", "*");
-        }
+        // P1-09: do NOT emit a wildcard ACAO by default. CORS is opt-in
+        // and configured via cors_.origins. Without an explicit list we
+        // send no CORS headers and the browser falls back to same-origin
+        // only. apply_cors() still runs per-request when an allow-list is
+        // configured.
         res.set_content(j.dump(), "application/json");
     }
     void ok(httplib::Response& res, const json& data) { send_json(res, 200, json{{"data", data}}); }
     void err(httplib::Response& res, int code, const std::string& msg) { send_json(res, code, json{{"message", msg}, {"data", nullptr}}); }
 
+    // P1-12: cap parsed JSON depth so a deeply nested payload (e.g.
+    // `[[[[...]]]]` 10k deep) cannot blow the stack when the document
+    // is later walked recursively for indexing / RLS / aggregation.
+    static bool json_depth_within(const json& v, int remaining) {
+        if (remaining < 0) return false;
+        if (v.is_object()) {
+            for (auto it = v.begin(); it != v.end(); ++it) {
+                if (!json_depth_within(it.value(), remaining - 1)) return false;
+            }
+        } else if (v.is_array()) {
+            for (auto& e : v) if (!json_depth_within(e, remaining - 1)) return false;
+        }
+        return true;
+    }
+    static constexpr int kMaxJsonDepth = 64;
+
+    // P1-10: derive the originating client IP. When a trusted proxy
+    // (`trusted_proxies_`) terminates TLS in front of us, prefer the
+    // left-most entry in `X-Forwarded-For` so per-IP limits / audit
+    // logs reflect the actual client rather than the proxy. Without a
+    // configured trusted proxy list we always use req.remote_addr so
+    // a hostile client cannot spoof its address.
+    std::string client_ip(const httplib::Request& req) const {
+        if (!trusted_proxies_.empty() && trusted_proxies_.count(req.remote_addr)) {
+            std::string xff = req.get_header_value("X-Forwarded-For");
+            if (!xff.empty()) {
+                auto comma = xff.find(',');
+                std::string first = (comma == std::string::npos) ? xff : xff.substr(0, comma);
+                // trim
+                while (!first.empty() && std::isspace((unsigned char)first.front())) first.erase(first.begin());
+                while (!first.empty() && std::isspace((unsigned char)first.back())) first.pop_back();
+                if (!first.empty()) return first;
+            }
+        }
+        return req.remote_addr;
+    }
+
     json parse_body(const httplib::Request& req) {
         if (req.body.empty()) return json::object();
-        try { return json::parse(req.body); } catch(...) { return json::object(); }
+        try {
+            json parsed = json::parse(req.body);
+            if (!json_depth_within(parsed, kMaxJsonDepth)) return json::object();
+            return parsed;
+        } catch(...) { return json::object(); }
     }
 
     // -----------------------------------------------------------------------
@@ -569,23 +626,27 @@ private:
         // Pass through auth + cluster headers. Add our hop marker so the
         // upstream peer doesn't try to re-forward.
         for (auto& [k, v] : req.headers) {
-            if (k == "Host" || k == "Content-Length") continue;
+            if (k == "Host" || k == "Content-Length" ||
+                k.find("X-Delta-Internal-") == 0 || k == "X-Delta-Cluster-Token") continue;
             h.emplace(k, v);
         }
         h.emplace("X-Delta-Shard-Hop", local_shard_.empty() ? "?" : local_shard_);
-        if (!shard_token_.empty())
-            h.emplace("X-Delta-Cluster-Token", shard_token_);
-        // Round 3: propagate the gateway-validated user identity so the
-        // receiving shard can apply the same identity without replicating
-        // the session DB. require_auth() on the receiving side honours
-        // this header when paired with a matching X-Delta-Cluster-Token.
         if (!shard_token_.empty()) {
+            h.emplace("X-Delta-Cluster-Token", shard_token_);
             auth::Session s;
             httplib::Response throwaway;
             if (require_auth(req, throwaway, &s)) {
                 h.emplace("X-Delta-Internal-User",   s.username);
                 h.emplace("X-Delta-Internal-DB",     s.database);
                 h.emplace("X-Delta-Internal-Schema", s.schema);
+                uint64_t ts = now_ms();
+                std::string nonce = random_hex(8);
+                std::string payload = s.username + ":" + s.database + ":" + s.schema + ":" + std::to_string(ts) + ":" + nonce + ":" + req.path + ":" + req.body;
+                auto sig_v = auth::hmac_sha256(reinterpret_cast<const uint8_t*>(shard_token_.data()), shard_token_.size(),
+                                               reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+                h.emplace("X-Delta-Internal-TS", std::to_string(ts));
+                h.emplace("X-Delta-Internal-Nonce", nonce);
+                h.emplace("X-Delta-Internal-Sig", auth::hex_encode(sig_v));
             }
         }
         std::string path = req.path;
@@ -919,7 +980,23 @@ private:
     bool gateway_handle_transaction(const httplib::Request& req,
                                     httplib::Response& res,
                                     json& parsed_body) {
-        if (!sharding_enabled() || req_is_local_hop(req)) return false;
+        if (!sharding_enabled()) return false;
+        if (req_is_local_hop(req)) {
+            // P0-07: receiving side MUST verify every op actually belongs
+            // to this shard. A spoofed X-Delta-Shard-Hop with a multi-shard
+            // body would otherwise write peer data into our local store.
+            auto touched = tx_shards_for_body(parsed_body);
+            for (auto& sid : touched) {
+                if (sid != local_shard_) {
+                    send_json(res, Status::UNSUPPORTED, json{
+                        {"message", "transaction op routes to non-local shard"},
+                        {"data", json{{"local", local_shard_}, {"foreign", sid}}}
+                    });
+                    return true;
+                }
+            }
+            return false;
+        }
         auto touched = tx_shards_for_body(parsed_body);
         if (touched.empty()) return false;
         if (touched.size() > 1) {
@@ -1028,7 +1105,8 @@ private:
                 cli.set_keep_alive(false);
                 httplib::Headers h;
                 for (auto& [k, v] : req.headers) {
-                    if (k == "Host" || k == "Content-Length") continue;
+                    if (k == "Host" || k == "Content-Length" ||
+                        k.find("X-Delta-Internal-") == 0 || k == "X-Delta-Cluster-Token") continue;
                     h.emplace(k, v);
                 }
                 h.emplace("X-Delta-Shard-Hop",     local_shard_.empty() ? "?" : local_shard_);
@@ -1040,6 +1118,15 @@ private:
                         h.emplace("X-Delta-Internal-User",   s.username);
                         h.emplace("X-Delta-Internal-DB",     s.database);
                         h.emplace("X-Delta-Internal-Schema", s.schema);
+                        uint64_t ts = now_ms();
+                        std::string nonce = random_hex(8);
+                        // Using `path` and `body` which are passed into broadcast_to_peer_shards
+                        std::string payload = s.username + ":" + s.database + ":" + s.schema + ":" + std::to_string(ts) + ":" + nonce + ":" + path + ":" + body;
+                        auto sig_v = auth::hmac_sha256(reinterpret_cast<const uint8_t*>(shard_token_.data()), shard_token_.size(),
+                                                       reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+                        h.emplace("X-Delta-Internal-TS", std::to_string(ts));
+                        h.emplace("X-Delta-Internal-Nonce", nonce);
+                        h.emplace("X-Delta-Internal-Sig", auth::hex_encode(sig_v));
                     }
                 }
                 if (method == "POST")        cli.Post(path.c_str(), h, body, "application/json");
@@ -1062,17 +1149,66 @@ private:
     // having to replicate the session DB. Security: the cluster token
     // is a shared secret known only to operator-configured nodes, so a
     // third party cannot forge it.
+    // P1-06: validate that an operator-supplied URL points at one of the
+    // shards we already trust. The check is conservative: we accept only
+    // http://host:port or https://host:port that exactly matches a known
+    // shard peer's `base_url()`. Blocks loopback, link-local, AWS/GCP
+    // metadata services, and arbitrary internal hosts.
+    bool is_allowed_cluster_url(const std::string& url) const {
+        if (!sharding_enabled()) {
+            // Without a shard map we have no whitelist to consult, so
+            // refuse rather than fail-open.
+            return false;
+        }
+        for (auto& sh : shard_map_.shards()) {
+            for (auto& p : sh.peers) {
+                if (url == p.base_url()) return true;
+            }
+        }
+        return false;
+    }
+
     bool require_auth(const httplib::Request& req, httplib::Response& res, auth::Session* out_sess) {
+        // P2-09: constant-time cluster token comparison.
         if (!shard_token_.empty() &&
-            req.get_header_value("X-Delta-Cluster-Token") == shard_token_ &&
-            req.has_header("X-Delta-Internal-User")) {
+            auth::constant_time_compare(req.get_header_value("X-Delta-Cluster-Token"), shard_token_) &&
+            req.has_header("X-Delta-Internal-User") &&
+            req.has_header("X-Delta-Internal-Sig")) {
+
             std::string user = req.get_header_value("X-Delta-Internal-User");
+            std::string db = req.get_header_value("X-Delta-Internal-DB");
+            if (db.empty()) db = "default";
+            std::string schema = req.get_header_value("X-Delta-Internal-Schema");
+            if (schema.empty()) schema = "public";
+            std::string ts_str = req.get_header_value("X-Delta-Internal-TS");
+            std::string nonce = req.get_header_value("X-Delta-Internal-Nonce");
+            std::string sig = req.get_header_value("X-Delta-Internal-Sig");
+
+            uint64_t ts = 0;
+            try { ts = std::stoull(ts_str); } catch (...) {}
+            if (now_ms() > ts + 60000) {
+                err(res, Status::UNAUTHORIZED, "internal token expired"); return false;
+            }
+            {
+                std::lock_guard<std::mutex> lk(replay_mu_);
+                if (seen_nonces_.count(nonce)) {
+                    err(res, Status::UNAUTHORIZED, "replay detected"); return false;
+                }
+                seen_nonces_.insert(nonce);
+                if (seen_nonces_.size() > 10000) seen_nonces_.clear();
+            }
+
+            std::string payload = user + ":" + db + ":" + schema + ":" + ts_str + ":" + nonce + ":" + req.path + ":" + req.body;
+            auto sig_v = auth::hmac_sha256(reinterpret_cast<const uint8_t*>(shard_token_.data()), shard_token_.size(),
+                                           reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+            if (sig != auth::hex_encode(sig_v)) {
+                err(res, Status::UNAUTHORIZED, "invalid internal signature"); return false;
+            }
+
             out_sess->token    = "internal";
             out_sess->username = user;
-            out_sess->database = req.get_header_value("X-Delta-Internal-DB");
-            if (out_sess->database.empty()) out_sess->database = "default";
-            out_sess->schema   = req.get_header_value("X-Delta-Internal-Schema");
-            if (out_sess->schema.empty()) out_sess->schema = "public";
+            out_sess->database = db;
+            out_sess->schema   = schema;
             out_sess->client_ip = req.remote_addr;
             return true;
         }
@@ -1091,6 +1227,18 @@ private:
         if (auth_->is_superuser(s.username)) return true;
         if (!auth_->check(s.username, privs, target)) { err(res, Status::FORBIDDEN, "permission denied"); return false; }
         return true;
+    }
+
+    // P1-07: every user / role management endpoint must require either
+    // superuser or the well-known `user_admin` role. Anything less lets a
+    // normal authenticated user create a privileged user and trivially
+    // escalate.
+    bool require_user_admin(httplib::Response& res, const auth::Session& s) {
+        if (auth_->is_superuser(s.username)) return true;
+        auto roles = auth_->get_user_all_roles(s.username);
+        if (roles.count("user_admin")) return true;
+        err(res, Status::FORBIDDEN, "permission denied: user_admin required");
+        return false;
     }
 
     static auth::PrivilegeTarget col_target(const std::string& db, const std::string& sch, const std::string& col) {
@@ -1216,9 +1364,12 @@ private:
         // Served unauthenticated so any AI agent can `curl http://host/llms.txt`
         // and ingest the full SDK + protocol reference into its context.
         // Looked up from disk on first hit and cached in memory.
-        srv_.Get("/llms.txt", [this](const httplib::Request&, httplib::Response& res) {
+        srv_.Get("/llms.txt", [this](const httplib::Request& req, httplib::Response& res) {
             static std::string cached = find_llms_txt();
-            res.set_header("Access-Control-Allow-Origin", "*");
+            // P2-12: honour the configured CORS allow-list. Wildcard is
+            // unsafe for any cookie-authenticated endpoint and confusing
+            // for everything else, so we never emit `*` unconditionally.
+            apply_cors(req, res);
             res.set_header("Cache-Control", "public, max-age=300");
             if (cached.empty()) {
                 res.status = 404;
@@ -1308,6 +1459,11 @@ private:
             }
             auto st = auth_->create_user(user, pw, b);
             if (!st.ok()) { err(res, st.code, st.message); return; }
+            // P0-10: replicate the new user to peers BEFORE answering so
+            // subsequent requests routed to other shards see the
+            // freshly created identity. Best-effort: a failing peer
+            // logs and the local create still succeeds.
+            broadcast_to_peer_shards(req, "POST", req.path, req.body);
             auto u = auth_->get_user(user);
             ok(res, u ? u->to_json() : json::object());
         });
@@ -1325,42 +1481,62 @@ private:
         });
         srv_.Patch(R"(/api/v1/users/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!require_user_admin(res, s)) return;
             json b = parse_body(req);
             auto st = auth_->alter_user(req.matches[1], b);
             if (!st.ok()) { err(res, st.code, st.message); return; }
+            // P2-02: if the alter touched password or superuser status,
+            // kill every existing session for that user. Easier to be
+            // conservative and drop on any alter.
+            sessions_->revoke_all_for_user(req.matches[1]);
+            broadcast_to_peer_shards(req, "PATCH", req.path, req.body);
             ok(res, json{{"updated", true}});
         });
         srv_.Delete(R"(/api/v1/users/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!require_user_admin(res, s)) return;
             auto st = auth_->drop_user(req.matches[1]);
             if (!st.ok()) { err(res, st.code, st.message); return; }
+            sessions_->revoke_all_for_user(req.matches[1]); // P2-02
+            broadcast_to_peer_shards(req, "DELETE", req.path, "");
             ok(res, json{{"deleted", 1}});
         });
         srv_.Post(R"(/api/v1/users/([^/]+)/lock)", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!require_user_admin(res, s)) return;
             auto st = auth_->lock_user(req.matches[1]);
-            if (!st.ok()) { err(res, st.code, st.message); return; } ok(res, json{{"locked", true}});
+            if (!st.ok()) { err(res, st.code, st.message); return; }
+            sessions_->revoke_all_for_user(req.matches[1]); // P2-02
+            ok(res, json{{"locked", true}});
         });
         srv_.Post(R"(/api/v1/users/([^/]+)/unlock)", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!require_user_admin(res, s)) return;
             auto st = auth_->unlock_user(req.matches[1]);
             if (!st.ok()) { err(res, st.code, st.message); return; } ok(res, json{{"unlocked", true}});
         });
         srv_.Post(R"(/api/v1/users/([^/]+)/roles)", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!require_user_admin(res, s)) return;
             json b = parse_body(req);
             auto st = auth_->grant_role_to_user(req.matches[1], b.value("role", ""));
-            if (!st.ok()) { err(res, st.code, st.message); return; } ok(res, json{{"granted", true}});
+            if (!st.ok()) { err(res, st.code, st.message); return; }
+            broadcast_to_peer_shards(req, "POST", req.path, req.body);
+            ok(res, json{{"granted", true}});
         });
         srv_.Delete(R"(/api/v1/users/([^/]+)/roles/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!require_user_admin(res, s)) return;
             auto st = auth_->revoke_role_from_user(req.matches[1], req.matches[2]);
-            if (!st.ok()) { err(res, st.code, st.message); return; } ok(res, json{{"revoked", true}});
+            if (!st.ok()) { err(res, st.code, st.message); return; }
+            sessions_->revoke_all_for_user(req.matches[1]); // P2-02
+            ok(res, json{{"revoked", true}});
         });
 
         // ---------- ROLES ----------
         srv_.Post("/api/v1/roles", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!require_user_admin(res, s)) return;
             json b = parse_body(req);
             auto st = auth_->create_role(b.value("name",""), b.value("description",""), b.value("parents", std::vector<std::string>{}));
             if (!st.ok()) { err(res, st.code, st.message); return; }
@@ -1375,6 +1551,7 @@ private:
         });
         srv_.Delete(R"(/api/v1/roles/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!require_user_admin(res, s)) return;
             auto st = auth_->drop_role(req.matches[1]);
             if (!st.ok()) { err(res, st.code, st.message); return; } ok(res, json{{"deleted", 1}});
         });
@@ -1382,6 +1559,7 @@ private:
         // ---------- PERMISSIONS ----------
         srv_.Post("/api/v1/permissions/grant", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!require_user_admin(res, s)) return;
             json b = parse_body(req);
             auto t = auth::PrivilegeTarget::from_json(b["target"]);
             uint32_t privs = auth::parse_privileges(b.value("privileges", std::vector<std::string>{}));
@@ -1390,6 +1568,7 @@ private:
         });
         srv_.Post("/api/v1/permissions/revoke", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!require_user_admin(res, s)) return;
             json b = parse_body(req);
             auto t = auth::PrivilegeTarget::from_json(b["target"]);
             uint32_t privs = auth::parse_privileges(b.value("privileges", std::vector<std::string>{}));
@@ -1398,6 +1577,7 @@ private:
         });
         srv_.Post("/api/v1/permissions/grant-all", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            if (!require_user_admin(res, s)) return;
             json b = parse_body(req);
             auto t = auth::PrivilegeTarget::from_json(b["target"]);
             auto st = auth_->grant(b.value("role",""), auth::PRIV_ALL, t, b.value("with_grant_option", false), s.username);
@@ -1414,6 +1594,15 @@ private:
         // ---------- DATABASES ----------
         srv_.Post("/api/v1/databases", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
+            // P1-08: creating a database must require superuser or an
+            // explicit `can_create_db` user flag, otherwise any
+            // authenticated user can carve out resources.
+            if (!auth_->is_superuser(s.username)) {
+                auto u = auth_->get_user(s.username);
+                if (!u || !u->can_create_db) {
+                    err(res, Status::FORBIDDEN, "can_create_db required"); return;
+                }
+            }
             json b = parse_body(req);
             auto st = dbm_->create_database(b.value("name",""), b.value("owner", s.username), b.value("options", json::object()));
             if (!st.ok()) { err(res, st.code, st.message); return; }
@@ -1526,6 +1715,10 @@ private:
             if (!require_perm(res, s, auth::PRIV_DROP, col_target(db, sch, col_name))) return;
             auto st = col_->drop_collection(db, sch, col_name);
             if (!st.ok()) { err(res, st.code, st.message); return; }
+            // P0-11: replicate the drop to every peer shard so the
+            // collection metadata disappears cluster-wide. Without this
+            // peers keep accepting writes for an already-dropped name.
+            broadcast_to_peer_shards(req, "DELETE", req.path, "");
             ok(res, json{{"deleted", 1}});
         });
         srv_.Post(R"(/api/v1/collections/([^/]+)/indexes)", [this](const httplib::Request& req, httplib::Response& res) {
@@ -1580,10 +1773,16 @@ private:
             if (gateway_handle_bulk_insert(req, res, bulk_body)) return;
             if (!require_perm(res, s, auth::PRIV_INSERT, col_target(db, sch, col_name))) return;
             json b = parse_body(req);
+            // P1-03: RLS check per document.
+            auto roles_bulk = auth_->get_user_all_roles(s.username);
+            bool su_bulk = auth_->is_superuser(s.username);
             json ids = json::array();
             int inserted = 0;
             for (auto& item : b["documents"]) {
                 json doc = item.contains("document") ? item["document"] : item;
+                if (!su_bulk && !dbm_->check_rls_constraint(s.username, db, sch, col_name, "INSERT", doc, roles_bulk)) {
+                    err(res, Status::FORBIDDEN, "RLS violation in bulk insert"); return;
+                }
                 std::string id;
                 if (col_->insert(db, sch, col_name, doc, id).ok()) { ids.push_back(id); inserted++; }
             }
@@ -1630,6 +1829,17 @@ private:
             std::string db = req.get_param_value("database"); if (db.empty()) db = s.database;
             std::string sch = req.get_param_value("schema"); if (sch.empty()) sch = s.schema;
             if (!require_perm(res, s, auth::PRIV_UPDATE, col_target(db, sch, col_name))) return;
+            // P1-01: enforce RLS on UPDATE — both pre (existing row) and
+            // post (new row), to block both data exfiltration and write-
+            // promotion attempts.
+            if (!auth_->is_superuser(s.username)) {
+                auto roles_u = auth_->get_user_all_roles(s.username);
+                json existing;
+                if (col_->get(db, sch, col_name, id, &existing) &&
+                    !dbm_->check_rls_constraint(s.username, db, sch, col_name, "UPDATE", existing["data"], roles_u)) {
+                    err(res, Status::FORBIDDEN, "RLS denied"); return;
+                }
+            }
             json b = parse_body(req);
             // P1-6: optimistic-locking handle. RFC 7232-style `If-Match`
             // header wins; fall back to a `__if_version` body field if
@@ -1673,6 +1883,15 @@ private:
             std::string db = req.get_param_value("database"); if (db.empty()) db = s.database;
             std::string sch = req.get_param_value("schema"); if (sch.empty()) sch = s.schema;
             if (!require_perm(res, s, auth::PRIV_DELETE, col_target(db, sch, col_name))) return;
+            // P1-02: RLS check on existing row before removing.
+            if (!auth_->is_superuser(s.username)) {
+                auto roles_d = auth_->get_user_all_roles(s.username);
+                json existing;
+                if (col_->get(db, sch, col_name, id, &existing) &&
+                    !dbm_->check_rls_constraint(s.username, db, sch, col_name, "DELETE", existing["data"], roles_d)) {
+                    err(res, Status::FORBIDDEN, "RLS denied"); return;
+                }
+            }
             auto st = col_->remove(db, sch, col_name, id);
             if (!st.ok()) { err(res, st.code, st.message); return; }
             ok(res, json{{"deleted", 1}});
@@ -1684,7 +1903,20 @@ private:
             std::string sch = req.get_param_value("schema"); if (sch.empty()) sch = s.schema;
             if (!require_perm(res, s, auth::PRIV_SELECT, col_target(db, sch, col_name))) return;
             json b = parse_body(req);
-            json result = col_->aggregate(db, sch, col_name, b.value("pipeline", json::array()));
+            // P1-04: prepend an RLS-derived $match stage so non-superuser
+            // aggregations never observe rows outside their policy.
+            json pipeline = b.value("pipeline", json::array());
+            if (!auth_->is_superuser(s.username)) {
+                auto roles_ag = auth_->get_user_all_roles(s.username);
+                json rls_filter = dbm_->apply_rls_filter(s.username, db, sch, col_name, "SELECT", json::object(), roles_ag);
+                if (!rls_filter.empty()) {
+                    json prepended = json::array();
+                    prepended.push_back(json{{"$match", rls_filter}});
+                    for (auto& st : pipeline) prepended.push_back(st);
+                    pipeline = prepended;
+                }
+            }
+            json result = col_->aggregate(db, sch, col_name, pipeline);
             ok(res, result);
         });
 
@@ -1748,6 +1980,36 @@ private:
                 if (!require_perm(res, s, need, col_target(db, sch, col))) return;
             }
 
+            // P1-05: enforce RLS on every transaction op before begin().
+            if (!auth_->is_superuser(s.username)) {
+                auto roles_tx = auth_->get_user_all_roles(s.username);
+                for (size_t i = 0; i < ops.size(); ++i) {
+                    const json& o = ops[i];
+                    std::string kind = o.value("op", std::string());
+                    std::string tdb = o.value("database", s.database);
+                    std::string tsch = o.value("schema", s.schema);
+                    std::string tcol = o.value("collection", std::string());
+                    if (kind == "insert") {
+                        json doc = o.value("doc", json::object());
+                        if (!dbm_->check_rls_constraint(s.username, tdb, tsch, tcol, "INSERT", doc, roles_tx)) {
+                            err(res, Status::FORBIDDEN,
+                                "op[" + std::to_string(i) + "]: RLS denied"); return;
+                        }
+                    } else if (kind == "update" || kind == "remove") {
+                        std::string id = o.value("id", std::string());
+                        if (id.empty()) continue;
+                        json existing;
+                        if (col_->get(tdb, tsch, tcol, id, &existing)) {
+                            std::string verb = (kind == "update") ? "UPDATE" : "DELETE";
+                            if (!dbm_->check_rls_constraint(s.username, tdb, tsch, tcol, verb, existing["data"], roles_tx)) {
+                                err(res, Status::FORBIDDEN,
+                                    "op[" + std::to_string(i) + "]: RLS denied"); return;
+                            }
+                        }
+                    }
+                }
+            }
+
             auto tx = col_->begin_transaction();
             for (size_t i = 0; i < ops.size(); ++i) {
                 const json& o = ops[i];
@@ -1790,8 +2052,15 @@ private:
             std::string col_name = req.matches[1];
             std::string db = req.get_param_value("database"); if (db.empty()) db = s.database;
             std::string sch = req.get_param_value("schema"); if (sch.empty()) sch = s.schema;
+            // P1-04: enforce SELECT privilege and RLS on COUNT.
+            if (!require_perm(res, s, auth::PRIV_SELECT, col_target(db, sch, col_name))) return;
             json b = parse_body(req);
-            ok(res, json{{"count", col_->count(db, sch, col_name, b.value("filter", json::object()))}});
+            json filter = b.value("filter", json::object());
+            if (!auth_->is_superuser(s.username)) {
+                auto roles_c = auth_->get_user_all_roles(s.username);
+                filter = dbm_->apply_rls_filter(s.username, db, sch, col_name, "SELECT", filter, roles_c);
+            }
+            ok(res, json{{"count", col_->count(db, sch, col_name, filter)}});
         });
 
         // ---------- VECTORS ----------
@@ -1889,8 +2158,9 @@ private:
         });
         srv_.Get(R"(/api/v1/cache/([^/]+)/list)", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
-            int start = std::stoi(req.get_param_value("start").empty() ? "0" : req.get_param_value("start"));
-            int stop = std::stoi(req.get_param_value("stop").empty() ? "-1" : req.get_param_value("stop"));
+            int start = 0, stop = -1;
+            try { auto v = req.get_param_value("start"); if (!v.empty()) start = std::stoi(v); } catch (...) {}
+            try { auto v = req.get_param_value("stop");  if (!v.empty()) stop  = std::stoi(v); } catch (...) {}
             ok(res, json{{"items", cache_->lrange(req.matches[1], start, stop)}});
         });
         srv_.Post(R"(/api/v1/cache/([^/]+)/set)", [this](const httplib::Request& req, httplib::Response& res) {
@@ -1913,8 +2183,9 @@ private:
         });
         srv_.Get(R"(/api/v1/cache/([^/]+)/zset)", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
-            int start = std::stoi(req.get_param_value("start").empty() ? "0" : req.get_param_value("start"));
-            int stop = std::stoi(req.get_param_value("stop").empty() ? "-1" : req.get_param_value("stop"));
+            int start = 0, stop = -1;
+            try { auto v = req.get_param_value("start"); if (!v.empty()) start = std::stoi(v); } catch (...) {}
+            try { auto v = req.get_param_value("stop");  if (!v.empty()) stop  = std::stoi(v); } catch (...) {}
             auto items = cache_->zrange(req.matches[1], start, stop, true);
             json arr = json::array();
             for (auto& [m, sc] : items) arr.push_back({{"member", m}, {"score", sc}});
@@ -1979,7 +2250,9 @@ private:
         });
         srv_.Delete(R"(/api/v1/connections/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
             auth::Session s; if (!require_auth(req, res, &s)) return;
-            uint64_t id = std::stoull(std::string(req.matches[1]));
+            uint64_t id = 0;
+            try { id = std::stoull(std::string(req.matches[1])); }
+            catch (...) { err(res, Status::INVALID, "bad connection id"); return; }
             pool_->close(id);
             ok(res, json{{"closed", 1}});
         });
@@ -2100,10 +2373,23 @@ private:
         });
 
         // ---------- /metrics (Prometheus text format) -----------------
-        // Unauthenticated by convention — scrapers run inside the trust
-        // boundary. Use a reverse proxy / network policy to restrict
-        // access if you expose the server to the public internet.
-        srv_.Get("/metrics", [this](const httplib::Request& /*req*/, httplib::Response& res) {
+        // P2-04: require either a valid cluster token or a valid user
+        // session. Operators that need anonymous scrapes can keep
+        // shard_token_ empty (single-node dev), but multi-node clusters
+        // must authenticate so the topology / counters don't leak.
+        srv_.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
+            // Allow if cluster token matches OR a valid session token.
+            bool ok_auth = false;
+            if (!shard_token_.empty() &&
+                auth::constant_time_compare(req.get_header_value("X-Delta-Cluster-Token"), shard_token_)) {
+                ok_auth = true;
+            } else {
+                auth::Session s; httplib::Response throwaway;
+                if (require_auth(req, throwaway, &s)) ok_auth = true;
+            }
+            if (!ok_auth && !shard_token_.empty()) {
+                err(res, Status::UNAUTHORIZED, "cluster token or bearer required"); return;
+            }
             auto cs = cache_->stats();
             uint64_t up   = std::max<uint64_t>(1, (now_ms() - start_time_) / 1000);
             uint64_t reqs = req_count_.load(std::memory_order_relaxed);
@@ -2198,11 +2484,21 @@ private:
             const auto& expected = repl_->token();
             if (expected.empty()) return true;
             auto got = req.get_header_value("X-Delta-Cluster-Token");
-            if (got != expected) { err(res, Status::UNAUTHORIZED, "invalid cluster token"); return false; }
+            if (!auth::constant_time_compare(got, expected)) { err(res, Status::UNAUTHORIZED, "invalid cluster token"); return false; }
             return true;
         };
 
-        srv_.Get("/api/v1/cluster/info", [this](const httplib::Request&, httplib::Response& res) {
+        srv_.Get("/api/v1/cluster/info", [this](const httplib::Request& req, httplib::Response& res) {
+            // P2-04: require cluster token (or any valid session) so the
+            // topology / role / lsn snapshot isn't world-readable.
+            const auto& expected = repl_->token();
+            bool ok_auth = expected.empty(); // open mode for single-node dev
+            if (!ok_auth && auth::constant_time_compare(
+                    req.get_header_value("X-Delta-Cluster-Token"), expected)) ok_auth = true;
+            if (!ok_auth) {
+                auth::Session s;
+                if (!require_auth(req, res, &s)) return;
+            }
             json info = {
                 {"role", role_name(repl_->role())},
                 {"read_only", repl_->read_only()},
@@ -2223,8 +2519,9 @@ private:
             if (!check_token(req, res)) return;
             if (repl_->role() != Role::Master) { err(res, Status::FORBIDDEN, "not a master"); return; }
             uint64_t from = 0; size_t limit = 1000;
-            if (req.has_param("from_lsn")) from = std::stoull(req.get_param_value("from_lsn"));
-            if (req.has_param("limit")) limit = (size_t)std::stoul(req.get_param_value("limit"));
+            // P1-15: tolerate junk numerics instead of crashing on stoull.
+            if (req.has_param("from_lsn")) { try { from  = std::stoull(req.get_param_value("from_lsn")); } catch (...) {} }
+            if (req.has_param("limit"))    { try { limit = (size_t)std::stoul (req.get_param_value("limit"));    } catch (...) {} }
             auto cr = repl_->get_changes(from, limit);
             std::string id = req.get_header_value("X-Delta-Replica-Id");
             if (!id.empty()) repl_->register_replica(id, req.remote_addr, from);
@@ -2258,6 +2555,12 @@ private:
             json b = parse_body(req);
             std::string url = b.value("master_url", "");
             if (url.empty()) { err(res, Status::INVALID, "master_url required"); return; }
+            // P1-06: SSRF guard. Only allow http(s) URLs whose host is
+            // one of the configured cluster peers. Blocks loopback,
+            // metadata services, and arbitrary internal hosts.
+            if (!is_allowed_cluster_url(url)) {
+                err(res, Status::FORBIDDEN, "master_url not in cluster peer whitelist"); return;
+            }
             repl_->demote_to_replica(url);
             ok(res, json{{"role", role_name(repl_->role())}, {"master_url", url}});
         });
@@ -2288,7 +2591,7 @@ private:
             std::string expected = repl_ ? repl_->token() : std::string();
             if (expected.empty()) return true;
             auto got = req.get_header_value("X-Delta-Cluster-Token");
-            if (got != expected) {
+            if (!auth::constant_time_compare(got, expected)) {
                 err(res, Status::UNAUTHORIZED, "invalid cluster token");
                 return false;
             }
@@ -2545,7 +2848,7 @@ private:
         auto check_cluster_tok = [this](const httplib::Request& req,
                                         httplib::Response& res) {
             if (shard_token_.empty()) return true;  // open mode
-            if (req.get_header_value("X-Delta-Cluster-Token") == shard_token_) return true;
+            if (auth::constant_time_compare(req.get_header_value("X-Delta-Cluster-Token"), shard_token_)) return true;
             err(res, Status::UNAUTHORIZED, "cluster token required");
             return false;
         };
@@ -2762,6 +3065,9 @@ private:
     std::map<std::string, MMPeerState> mm_state_;
     std::atomic<uint64_t>    mm_changes_pulled_{0};
     std::atomic<uint64_t>    mm_changes_pushed_in_{0};
+
+    std::mutex replay_mu_;
+    std::set<std::string> seen_nonces_;
 };
 
 } // namespace delta::network

@@ -13,6 +13,7 @@
 // =============================================================================
 #include "../core/common.hpp"
 #include "../cache/cache_engine.hpp"
+#include "../auth/auth_manager.hpp"
 #include "deltaql_server.hpp"   // pulls HttpLoopback
 
 #include <httplib.h>             // for query encoding helper
@@ -107,10 +108,14 @@ inline WsTrafficCounters& ws_traffic() { static WsTrafficCounters g; return g; }
 
 class WsConnection : public std::enable_shared_from_this<WsConnection> {
 public:
-    WsConnection(int fd, HttpLoopback* lb, cache::CacheEngine* cache)
-        : fd_(fd), lb_(lb), cache_(cache) {
+    WsConnection(int fd, HttpLoopback* lb, auth::SessionManager* sessions, cache::CacheEngine* cache)
+        : fd_(fd), lb_(lb), sessions_(sessions), cache_(cache) {
         int yes = 1;
         ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+        struct timeval tv;
+        tv.tv_sec = 30; // 30s read timeout
+        tv.tv_usec = 0;
+        ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
     ~WsConnection() { close_fd(); }
 
@@ -142,7 +147,11 @@ private:
             if (fd < 0) return false;
             ssize_t r = ::recv(fd, buf + got, n - got, 0);
             if (r == 0) return false;
-            if (r < 0) { if (errno == EINTR) continue; return false; }
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
+                return false;
+            }
             got += (size_t)r;
         }
         return true;
@@ -240,6 +249,7 @@ private:
                 plen = 0;
                 for (int i = 0; i < 8; i++) plen = (plen << 8) | e[i];
             }
+            if (plen > 16 * 1024 * 1024) return -1; // 16MB max
             uint8_t mask[4] = {0,0,0,0};
             if (masked && !read_exact(mask, 4)) return -1;
             std::string chunk(plen, '\0');
@@ -252,7 +262,21 @@ private:
                 continue;
             }
             if (op == 0xA) continue;                       // pong, ignore
-            if (first_op == -1 && op != 0x0) first_op = op;
+            // P0-14: enforce fragmentation rules from RFC 6455 §5.4.
+            //   * First frame must carry a non-continuation opcode.
+            //   * Continuation frames must carry opcode 0x0.
+            //   * Control frames (already short-circuited above) must
+            //     not appear here.
+            //   * Mid-stream opcode flips reject the connection rather
+            //     than concatenating mismatched data.
+            if (first_op == -1) {
+                if (op == 0x0) return -1;   // first frame may not be cont.
+                first_op = op;
+            } else {
+                if (op != 0x0) return -1;   // mid-stream opcode change.
+            }
+            // Cap reassembled message size separately from per-frame.
+            if (out.size() + chunk.size() > 16 * 1024 * 1024) return -1;
             out.append(chunk);
             ws_traffic().frames_recv.fetch_add(1, std::memory_order_relaxed);
             ws_traffic().bytes_recv.fetch_add(plen, std::memory_order_relaxed);
@@ -291,8 +315,16 @@ private:
             send_json({{"type","pong"},{"rid",rid}});
         } else if (type == "auth") {
             if (p.contains("token")) {
-                token_ = p["token"].get<std::string>();
-                send_json({{"type","auth_ok"},{"rid",rid},{"token",token_}});
+                std::string t = p["token"].get<std::string>();
+                httplib::Headers hdrs = {{"Authorization", "Bearer " + t}};
+                auto r = lb_->dispatch("GET", "/api/v1/auth/me", hdrs, "");
+                if (r.status == 200) {
+                    token_ = t;
+                    send_json({{"type","auth_ok"},{"rid",rid},{"token",token_}});
+                } else {
+                    json bj; try { bj = json::parse(r.body); } catch(...) {}
+                    send_json({{"type","error"},{"rid",rid},{"message","invalid token"},{"status",r.status},{"body",bj}});
+                }
                 return;
             }
             json body;
@@ -305,6 +337,10 @@ private:
             }
             send_json({{"type","response"},{"rid",rid},{"status",r.status},{"body",bj}});
         } else if (type == "subscribe") {
+            if (token_.empty() || !sessions_->get(token_)) {
+                send_error(rid, "unauthorized");
+                return;
+            }
             auto ch = p.value("channel", std::string());
             if (ch.empty()) { send_error(rid, "channel required"); return; }
             { std::lock_guard<std::mutex> g(sub_mu_); subs_.insert(ch); }
@@ -316,6 +352,9 @@ private:
             send_json({{"type","response"},{"rid",rid},{"status",200},
                        {"body", {{"code",200},{"data",{{"unsubscribed",ch}}}}}});
         } else if (type == "request") {
+            if (!token_.empty() && !sessions_->get(token_)) {
+                token_.clear(); // session became invalid
+            }
             auto method = p.value("method", std::string("GET"));
             auto path   = p.value("path",   std::string("/"));
             std::string url = path;
@@ -354,6 +393,7 @@ private:
 
     std::atomic<int>      fd_;
     HttpLoopback*         lb_;
+    auth::SessionManager* sessions_;
     cache::CacheEngine*   cache_;
     std::string           token_;
     std::atomic<bool>     running_{false};
@@ -366,8 +406,8 @@ private:
 class WebSocketServer {
 public:
     WebSocketServer(const std::string& host, int port, HttpLoopback* lb,
-                    cache::CacheEngine* cache)
-        : host_(host), port_(port), lb_(lb), cache_(cache) {}
+                    auth::SessionManager* sessions, cache::CacheEngine* cache)
+        : host_(host), port_(port), lb_(lb), sessions_(sessions), cache_(cache) {}
 
     void start() {
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -407,7 +447,7 @@ private:
             sockaddr_in cli{}; socklen_t clen = sizeof(cli);
             int fd = ::accept(listen_fd_, (sockaddr*)&cli, &clen);
             if (fd < 0) { if (!running_) return; continue; }
-            auto conn = std::make_shared<WsConnection>(fd, lb_, cache_);
+            auto conn = std::make_shared<WsConnection>(fd, lb_, sessions_, cache_);
             { std::lock_guard<std::mutex> g(conns_mu_); conns_.push_back(conn); }
             ws_traffic().total_conns.fetch_add(1, std::memory_order_relaxed);
             ws_traffic().active_conns.fetch_add(1, std::memory_order_relaxed);
@@ -433,6 +473,7 @@ private:
     std::string host_;
     int         port_;
     HttpLoopback* lb_;
+    auth::SessionManager* sessions_;
     cache::CacheEngine* cache_;
     int                 listen_fd_ = -1;
     std::atomic<bool>   running_{true};

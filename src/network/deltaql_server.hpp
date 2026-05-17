@@ -23,6 +23,7 @@
 // =============================================================================
 #include "deltaql_protocol.hpp"
 #include "../core/common.hpp"
+#include "../auth/auth_manager.hpp"
 #include "../cache/cache_engine.hpp"
 #include <httplib.h>
 
@@ -123,11 +124,15 @@ inline DqlTrafficCounters& dql_traffic() { static DqlTrafficCounters g; return g
 // ---------------------------------------------------------------------------
 class DqlConnection : public std::enable_shared_from_this<DqlConnection> {
 public:
-    DqlConnection(int fd, HttpLoopback* lb, cache::CacheEngine* cache)
-        : fd_(fd), lb_(lb), cache_(cache) {
+    DqlConnection(int fd, HttpLoopback* lb, auth::SessionManager* sessions, cache::CacheEngine* cache)
+        : fd_(fd), lb_(lb), sessions_(sessions), cache_(cache) {
         int yes = 1;
         ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
         ::setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+        struct timeval tv;
+        tv.tv_sec = 30; // 30s read timeout
+        tv.tv_usec = 0;
+        ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
     ~DqlConnection() { shutdown_close(); }
 
@@ -177,6 +182,7 @@ private:
             if (r == 0) return false;
             if (r < 0) {
                 if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return false; // timeout
                 return false;
             }
             got += (size_t)r;
@@ -268,9 +274,15 @@ private:
                 std::string body = p.dump();
                 httplib::Headers hdrs;
                 if (p.contains("token")) {
-                    // No login needed; remember token for future REQUESTs.
-                    token_ = p["token"].get<std::string>();
-                    enqueue({0, dql::Type::AUTH_OK, f.rid, json{{"token", token_}}.dump()});
+                    std::string t = p["token"].get<std::string>();
+                    hdrs.emplace("Authorization", "Bearer " + t);
+                    auto r = lb_->dispatch("GET", "/api/v1/auth/me", hdrs, "");
+                    if (r.status == 200) {
+                        token_ = t;
+                        enqueue({0, dql::Type::AUTH_OK, f.rid, json{{"token", token_}}.dump()});
+                    } else {
+                        send_error(f.rid, "invalid token");
+                    }
                     break;
                 }
                 auto r = lb_->dispatch("POST", "/api/v1/auth/login", {}, body);
@@ -288,6 +300,10 @@ private:
                 enqueue({0, dql::Type::PONG, f.rid, "{}"});
                 break;
             case dql::Type::SUB: {
+                if (token_.empty() || !sessions_->get(token_)) {
+                    send_error(f.rid, "unauthorized");
+                    break;
+                }
                 json p; try { p = json::parse(f.payload); } catch(...) { send_error(f.rid,"bad json"); break; }
                 auto ch = p.value("channel", std::string());
                 if (ch.empty()) { send_error(f.rid, "channel required"); break; }
@@ -309,6 +325,9 @@ private:
                 break;
             }
             case dql::Type::REQUEST: {
+                if (!token_.empty() && !sessions_->get(token_)) {
+                    token_.clear();
+                }
                 json p; try { p = json::parse(f.payload); } catch(...) { send_error(f.rid,"bad json"); break; }
                 auto method = p.value("method", std::string("GET"));
                 auto path   = p.value("path",   std::string("/"));
@@ -352,6 +371,7 @@ private:
 
     std::atomic<int>                      fd_;
     HttpLoopback*                         lb_;
+    auth::SessionManager*                 sessions_;
     cache::CacheEngine*                   cache_;
     std::string                           token_;       // sticky auth
     std::atomic<bool>                     running_{false};
@@ -369,8 +389,8 @@ private:
 class DeltaQLServer {
 public:
     DeltaQLServer(const std::string& host, int port, HttpLoopback* lb,
-                  cache::CacheEngine* cache)
-        : host_(host), port_(port), lb_(lb), cache_(cache) {}
+                  auth::SessionManager* sessions, cache::CacheEngine* cache)
+        : host_(host), port_(port), lb_(lb), sessions_(sessions), cache_(cache) {}
 
     void start() {
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -419,7 +439,7 @@ private:
                 if (errno == EINTR) continue;
                 continue;
             }
-            auto conn = std::make_shared<DqlConnection>(fd, lb_, cache_);
+            auto conn = std::make_shared<DqlConnection>(fd, lb_, sessions_, cache_);
             register_conn(conn);
             dql_traffic().total_conns.fetch_add(1, std::memory_order_relaxed);
             dql_traffic().active_conns.fetch_add(1, std::memory_order_relaxed);
@@ -455,6 +475,7 @@ private:
     std::string host_;
     int         port_;
     HttpLoopback* lb_;
+    auth::SessionManager* sessions_;
     cache::CacheEngine* cache_;
     int                 listen_fd_  = -1;
     std::atomic<bool>   running_{true};

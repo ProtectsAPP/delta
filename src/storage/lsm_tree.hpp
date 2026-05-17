@@ -152,7 +152,7 @@ private:
 class WAL {
 public:
     explicit WAL(const std::string& path) : path_(path) {
-        fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (fd_ < 0) throw std::runtime_error("wal: cannot open " + path_);
     }
     ~WAL() { if (fd_ >= 0) ::close(fd_); }
@@ -235,7 +235,7 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         if (fd_ >= 0) ::close(fd_);
         ::unlink(path_.c_str());
-        fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (fd_ < 0) throw std::runtime_error("wal: cannot reopen " + path_);
         if (sync_on_append_) sync();
     }
@@ -304,7 +304,7 @@ struct SSTable {
         for (auto& [k, _e] : data) bf.add(k);
         std::string bloom_bytes = bf.empty() ? std::string{} : bf.serialize();
 
-        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd < 0) throw std::runtime_error("sstable: cannot create " + path);
 
         uint32_t magic     = constants::STORAGE_SSTABLE_MAGIC;
@@ -749,7 +749,7 @@ private:
         // the directory so the rename is durable too.
         std::string tmp   = dir_ + "/lsn.tmp";
         std::string final = dir_ + "/lsn";
-        int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd < 0) return;  // best effort
         std::string val = std::to_string(next_lsn_.load());
         ::write(fd, val.data(), val.size());

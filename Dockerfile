@@ -42,30 +42,27 @@ RUN cmake -S . -B build -G Ninja \
  && ctest --test-dir build --output-on-failure
 
 # ---------- 2) runtime --------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
-
-# libstdc++ + libgcc only; nothing else (no shell tooling, no package manager
-# leftovers). Run as a non-root user.
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        libstdc++6 libgcc-s1 ca-certificates tini netcat-openbsd \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -r delta && useradd -r -g delta -d /data -s /usr/sbin/nologin delta \
-    && mkdir -p /data && chown -R delta:delta /data
+# P0-17: distroless cc image. No shell, no apt, no netcat, no tini. Just
+# libstdc++ + libgcc + ca-certs. This removes the toolset an attacker
+# would otherwise have inside the container after a code execution flaw.
+# The delta_server binary is PID 1 directly; signal handling is built-in.
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /src/build/delta_server /usr/local/bin/delta_server
 COPY --from=builder /src/LICENSE            /usr/local/share/delta/LICENSE
 
-USER delta
+# nonroot user from distroless: uid 65532. /data must be a mounted
+# writable volume — the operator is responsible for chown'ing it.
+USER nonroot
 WORKDIR /data
 VOLUME ["/data"]
 
-# Inside the container, ~/.deltaql == /data thanks to the user's $HOME.
 ENV HOME=/data
 
 EXPOSE 16888 16889 16890
 
-# Light TCP health-check on the HTTP port — the REST listener is always on.
-HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
-    CMD nc -z 127.0.0.1 16888 || exit 1
+# distroless has no shell/nc, so the HEALTHCHECK is omitted. Operators
+# should configure an external probe (e.g. k8s readinessProbe with
+# httpGet on /healthz / port 16888).
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/delta_server"]
+ENTRYPOINT ["/usr/local/bin/delta_server"]

@@ -24,6 +24,7 @@
 //          is gone.
 // =============================================================================
 #pragma once
+#include <iostream>
 #include "../core/common.hpp"
 #include "../core/constants.hpp"
 #include "../storage/lsm_tree.hpp"
@@ -355,12 +356,20 @@ public:
         if (uptr) {
             ok = verify_password(password, uptr->salt, uptr->password_hash);
         } else {
-            // Lazily compute a dummy hash once (still PBKDF2, same cost).
-            if (dummy_hash_.empty()) {
-                std::string dsalt = random_hex(16);
-                dummy_hash_ = hash_password("this-account-does-not-exist", dsalt);
-            }
-            (void)verify_password(password, std::string{}, dummy_hash_);
+            // P2-10: derive a per-username dummy hash so an attacker
+            // enumerating user names cannot distinguish "user exists"
+            // from "user does not exist" by timing. We HMAC the
+            // (case-folded) username with a process-local key to pick a
+            // stable salt, then re-run the same PBKDF2 cost.
+            std::string lowered = username;
+            for (auto& c : lowered) c = (char)std::tolower((unsigned char)c);
+            auto k = dummy_key_();
+            auto mac = hmac_sha256(k.data(), k.size(),
+                                   reinterpret_cast<const uint8_t*>(lowered.data()),
+                                   lowered.size());
+            std::string dsalt = hex_encode(mac).substr(0, 32);
+            std::string dummy = hash_password("this-account-does-not-exist", dsalt);
+            (void)verify_password(password, std::string{}, dummy);
             ok = false;
         }
 
@@ -555,7 +564,14 @@ private:
         // default admin user
         if (!users_.count("admin")) {
             User u; u.id = next_user_id_++; u.username = "admin"; u.salt = random_hex(16);
-            u.password_hash = hash_password("admin", u.salt);
+            std::string init_pw = "admin";
+            if (const char* env_pw = std::getenv("DELTA_ADMIN_PASSWORD")) {
+                init_pw = env_pw;
+            } else {
+                init_pw = random_hex(12); // generate 24 char hex
+                std::cerr << "[Delta] WARNING: DELTA_ADMIN_PASSWORD not set. Generated admin password: " << init_pw << std::endl;
+            }
+            u.password_hash = hash_password(init_pw, u.salt);
             u.created_at = u.updated_at = now_ms();
             u.roles = {"superuser"};
             u.superuser = true; u.can_create_db = true; u.can_create_role = true;
@@ -572,6 +588,18 @@ private:
     uint64_t next_user_id_ = 1, next_role_id_ = 1, next_perm_id_ = 1;
     // Memoized dummy hash for the user-enumeration mitigation (P0-8).
     std::string dummy_hash_;
+    // P2-10: per-process random key used to derive a stable per-username
+    // dummy salt without leaking through the global state to disk.
+    std::vector<uint8_t> dummy_key_storage_;
+    std::mutex dummy_key_mu_;
+    const std::vector<uint8_t>& dummy_key_() {
+        std::lock_guard<std::mutex> lk(dummy_key_mu_);
+        if (dummy_key_storage_.empty()) {
+            dummy_key_storage_.resize(32);
+            delta::csprng_bytes(dummy_key_storage_.data(), 32);
+        }
+        return dummy_key_storage_;
+    }
 };
 
 // Session management
@@ -612,6 +640,18 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         std::vector<Session> out; for (auto& [_, s] : sessions_) out.push_back(s);
         return out;
+    }
+    // P2-02: revoke every active session for a given user. Called after
+    // password change, account lock, or role revocation so a stolen
+    // bearer token cannot outlive the credential it was issued against.
+    size_t revoke_all_for_user(const std::string& username) {
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t n = 0;
+        for (auto it = sessions_.begin(); it != sessions_.end(); ) {
+            if (it->second.username == username) { it = sessions_.erase(it); ++n; }
+            else ++it;
+        }
+        return n;
     }
 private:
     std::mutex mu_;

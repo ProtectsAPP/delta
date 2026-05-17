@@ -96,6 +96,14 @@ public:
         uint64_t cur_cnt  = state_  &  COUNTER_MASK;
         uint64_t rem_phys = remote  >> PHYSICAL_SHIFT;
         uint64_t rem_cnt  = remote  &  COUNTER_MASK;
+        // P1-13: cap remote drift to MAX_DRIFT_MS so a malicious peer
+        // cannot push our HLC arbitrarily far into the future and force
+        // LWW to always favour it. Clamp `rem_phys` to phys + drift.
+        constexpr uint64_t MAX_DRIFT_MS = 60 * 1000; // 60s
+        if (rem_phys > phys + MAX_DRIFT_MS) {
+            rem_phys = phys + MAX_DRIFT_MS;
+            rem_cnt  = 0;
+        }
         uint64_t max_phys = std::max({phys, cur_phys, rem_phys});
         uint64_t new_cnt;
         if (max_phys == cur_phys && max_phys == rem_phys) {

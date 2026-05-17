@@ -41,7 +41,14 @@ inline bool is_valid_collection_name(const std::string& s) {
 
 inline bool is_valid_password(const std::string& s) {
     using namespace constants;
-    return s.size() >= VALID_PASSWORD_MIN && s.size() <= VALID_PASSWORD_MAX;
+    if (s.size() < VALID_PASSWORD_MIN || s.size() > VALID_PASSWORD_MAX) return false;
+    // P1-16: reject ASCII control characters (NUL, TAB, newline, etc.).
+    // Unicode control runs are pinned out via the same byte check so
+    // they cannot smuggle in via overlong-encoded UTF-8 sequences either.
+    for (unsigned char c : s) {
+        if (c < 0x20 || c == 0x7F) return false;
+    }
+    return true;
 }
 
 // Parse helpers that NEVER throw. Originally we called std::stoi() directly

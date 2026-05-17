@@ -166,13 +166,19 @@ int main(int argc, char** argv) {
             json{{"cert", cfg.tls_cert}});
     }
 
-    // P1-24: refuse to silently expose cluster admin endpoints with no token.
-    // We don't *fail* startup so single-node dev still works, but we shout.
+    // P0-16: in any non-standalone deployment a missing cluster_token is
+    // a footgun (peers can be impersonated, /cluster/* admin endpoints
+    // run unauthenticated). We auto-generate a 32-byte random token when
+    // operator did not supply one and print it once on stderr so they
+    // can persist it. Refuse to start if writing it to stderr fails.
     if (cfg.role != "standalone" && cfg.cluster_token.empty()) {
+        cfg.cluster_token = delta::random_hex(32);
         std::cerr
             << "[Delta][WARN] role=" << cfg.role
-            << " but --cluster-token is empty. /cluster/* endpoints are unauthenticated.\n"
-            << "             Set --cluster-token=<long-random-string> for any non-dev deployment."
+            << " started without --cluster-token. Generated one:\n"
+            << "             DELTA_CLUSTER_TOKEN=" << cfg.cluster_token << "\n"
+            << "             Persist this value across restarts and on every peer,\n"
+            << "             otherwise peer-to-peer auth will fail after the next restart."
             << std::endl;
     }
 
@@ -357,13 +363,13 @@ int main(int argc, char** argv) {
     }
     if (cfg.deltaql_port > 0) {
         dql = std::make_unique<network::DeltaQLServer>(
-            cfg.http_host, cfg.deltaql_port, lb.get(), cache.get());
+            cfg.http_host, cfg.deltaql_port, lb.get(), sessions.get(), cache.get());
         try { dql->start(); }
         catch (const std::exception& e) { std::cerr << "[Delta] deltaql disabled: " << e.what() << "\n"; dql.reset(); }
     }
     if (cfg.ws_port > 0) {
         wss = std::make_unique<network::ws::WebSocketServer>(
-            cfg.http_host, cfg.ws_port, lb.get(), cache.get());
+            cfg.http_host, cfg.ws_port, lb.get(), sessions.get(), cache.get());
         try { wss->start(); }
         catch (const std::exception& e) { std::cerr << "[Delta] websocket disabled: " << e.what() << "\n"; wss.reset(); }
     }

@@ -45,7 +45,7 @@ namespace delta::network::dql {
 
 inline constexpr uint32_t MAGIC      = 0x444C5441u; // 'DLTA' big-endian
 inline constexpr uint8_t  VERSION    = 1;
-inline constexpr uint32_t MAX_FRAME  = 64u * 1024u * 1024u; // 64 MiB
+inline constexpr uint32_t MAX_FRAME  = 16u * 1024u * 1024u; // 16 MiB
 inline constexpr size_t   HEADER_LEN = 16;
 
 enum class Type : uint8_t {

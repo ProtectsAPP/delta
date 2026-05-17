@@ -190,10 +190,17 @@ inline std::vector<uint8_t> pbkdf2_hmac_sha256(const std::string& password,
 // use a `volatile` accumulator to deter compiler attempts at short-circuit
 // rewriting.
 inline bool constant_time_compare(const std::string& a, const std::string& b) {
-    if (a.size() != b.size()) return false;
-    volatile uint8_t diff = 0;
-    for (size_t i = 0; i < a.size(); ++i)
-        diff = static_cast<uint8_t>(diff | (uint8_t)((unsigned char)a[i] ^ (unsigned char)b[i]));
+    // P2-08: do not short-circuit on size mismatch. Walking the longer
+    // of the two strings to a fixed bound keeps the runtime independent
+    // of where (or whether) the inputs differ. We still fold the size
+    // delta into `diff` so unequal-length inputs reliably return false.
+    size_t n = a.size() > b.size() ? a.size() : b.size();
+    volatile uint8_t diff = static_cast<uint8_t>(a.size() ^ b.size());
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t ai = (i < a.size()) ? (uint8_t)(unsigned char)a[i] : 0;
+        uint8_t bi = (i < b.size()) ? (uint8_t)(unsigned char)b[i] : 0;
+        diff = static_cast<uint8_t>(diff | (uint8_t)(ai ^ bi));
+    }
     return diff == 0;
 }
 

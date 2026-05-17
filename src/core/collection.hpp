@@ -282,10 +282,21 @@ public:
     }
     Status drop_collection(const std::string& db, const std::string& sch, const std::string& col) {
         std::unique_lock<std::shared_mutex> lk(mu_);
-        // delete all docs
-        for (auto& [k, _] : store_->prefix_scan(doc_prefix(db, sch, col), 100000)) store_->del(k);
-        // delete all index entries
-        for (auto& [k, _] : store_->prefix_scan("idx:" + db + ":" + sch + ":" + col + ":", 1000000)) store_->del(k);
+        // P0-11 follow-up: drain in batches so a large collection actually
+        // gets dropped instead of leaving the tail behind.
+        const size_t batch = 100000;
+        while (true) {
+            auto rows = store_->prefix_scan(doc_prefix(db, sch, col), batch);
+            if (rows.empty()) break;
+            for (auto& [k, _] : rows) store_->del(k);
+            if (rows.size() < batch) break;
+        }
+        while (true) {
+            auto rows = store_->prefix_scan("idx:" + db + ":" + sch + ":" + col + ":", batch);
+            if (rows.empty()) break;
+            for (auto& [k, _] : rows) store_->del(k);
+            if (rows.size() < batch) break;
+        }
         store_->del(meta_key(db, sch, col));
         return Status::Ok();
     }

@@ -201,10 +201,13 @@ public:
         store_->put("rls_enabled:" + make_key(db, sch, col), enabled ? "1" : "0");
         return Status::Ok();
     }
-    bool is_rls_enabled(const std::string& db, const std::string& sch, const std::string& col) {
-        std::lock_guard<std::mutex> lk(mu_);
+    bool is_rls_enabled_unlocked(const std::string& db, const std::string& sch, const std::string& col) const {
         auto it = rls_enabled_.find(make_key(db, sch, col));
         return it != rls_enabled_.end() && it->second;
+    }
+    bool is_rls_enabled(const std::string& db, const std::string& sch, const std::string& col) {
+        std::lock_guard<std::mutex> lk(mu_);
+        return is_rls_enabled_unlocked(db, sch, col);
     }
     std::vector<RLSPolicy> list_policies(const std::string& db, const std::string& sch, const std::string& col) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -215,8 +218,8 @@ public:
     json apply_rls_filter(const std::string& username, const std::string& db, const std::string& sch, const std::string& col,
                           const std::string& cmd, const json& orig_filter,
                           const std::set<std::string>& user_roles) {
-        if (!is_rls_enabled(db, sch, col)) return orig_filter;
         std::lock_guard<std::mutex> lk(mu_);
+        if (!is_rls_enabled_unlocked(db, sch, col)) return orig_filter;
         auto& pols = policies_[make_key(db, sch, col)];
         json or_clause = json::array();
         bool found_applicable = false;
@@ -251,8 +254,8 @@ public:
     }
     bool check_rls_constraint(const std::string& username, const std::string& db, const std::string& sch, const std::string& col,
                               const std::string& cmd, const json& doc, const std::set<std::string>& user_roles) {
-        if (!is_rls_enabled(db, sch, col)) return true;
         std::lock_guard<std::mutex> lk(mu_);
+        if (!is_rls_enabled_unlocked(db, sch, col)) return true;
         auto& pols = policies_[make_key(db, sch, col)];
         for (auto& p : pols) {
             if (!p.enabled) continue;
@@ -342,18 +345,21 @@ private:
     //
     // The parser emits JSON filters compatible with FilterMatcher so the
     // result composes with the user's own filter via $and/$or. A parse
-    // failure returns json::object() which evaluates as "match everything"
-    // — same semantics as the old toy parser, so legacy policies that
-    // happened to typo through it keep their behaviour.
+    // failure returns an impossible match (P2-03 fail-closed) so a typo
+    // in a policy expression denies access instead of opening the table.
+    static json rls_never_matches() {
+        // _id is always a 32-hex string; "__rls_deny__" never matches.
+        return json{ {"_id", json{{"$eq", "__rls_deny__"}}} };
+    }
     json parse_simple_expr(const std::string& expr, const std::string& username) {
         RLSContext ctx{ expr, 0, username };
         try {
             json out = parse_or(ctx);
             skip_ws(ctx);
-            if (ctx.pos != ctx.src.size()) return json::object();
+            if (ctx.pos != ctx.src.size()) return rls_never_matches();
             return out;
         } catch (const std::exception&) {
-            return json::object();
+            return rls_never_matches();
         }
     }
 
