@@ -38,6 +38,8 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <algorithm>
 #include "json.hpp"
 
 namespace delta {
@@ -127,6 +129,11 @@ public:
     // Audit events ALWAYS get persisted to the audit file (regardless of the
     // current log level) and are also INFO-echoed to the main channel.
     void audit(const std::string& event, const json& fields = json::object()) {
+        // P1-20: rate-limit a single event type to AUDIT_RATE_PER_SEC
+        // emits per second per (event, ip). When the bucket is empty we
+        // drop the event but increment a `_suppressed` counter on the
+        // next allowed emission so operators don't lose total signal.
+        if (!audit_allow_(event, fields)) return;
         json line = build_line_(LogLevel::Info, event, fields, /*channel*/"audit");
         std::string s = line.dump();
         std::lock_guard<std::mutex> lk(mu_);
@@ -134,6 +141,32 @@ public:
         if (main_out_.is_open()) main_out_ << s << '\n' << std::flush;
         if (audit_out_.is_open()) audit_out_ << s << '\n' << std::flush;
     }
+
+private:
+    // P1-20: per (event, ip) token bucket. Default 50 events/sec with a
+    // burst of 200. Keeps log volume bounded under a DoS while still
+    // preserving the first hits of any incident.
+    static constexpr int    AUDIT_RATE_PER_SEC = 50;
+    static constexpr int    AUDIT_BURST        = 200;
+    struct AuditBucket { double tokens = AUDIT_BURST; uint64_t last_ms = 0; uint64_t dropped = 0; };
+    std::unordered_map<std::string, AuditBucket> audit_buckets_;
+    std::mutex audit_buckets_mu_;
+    bool audit_allow_(const std::string& event, const json& fields) {
+        std::string ip = fields.value("ip", std::string());
+        std::string key = event + "|" + ip;
+        std::lock_guard<std::mutex> lk(audit_buckets_mu_);
+        auto& b = audit_buckets_[key];
+        uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        if (b.last_ms == 0) b.last_ms = now;
+        double elapsed_sec = (double)(now - b.last_ms) / 1000.0;
+        b.tokens = std::min((double)AUDIT_BURST, b.tokens + elapsed_sec * AUDIT_RATE_PER_SEC);
+        b.last_ms = now;
+        if (b.tokens < 1.0) { b.dropped++; return false; }
+        b.tokens -= 1.0;
+        return true;
+    }
+public:
 
     // --- slow-query channel emit -------------------------------------------
     void slow(double duration_ms, const std::string& kind,

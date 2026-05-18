@@ -173,9 +173,13 @@ int main(int argc, char** argv) {
     // can persist it. Refuse to start if writing it to stderr fails.
     if (cfg.role != "standalone" && cfg.cluster_token.empty()) {
         cfg.cluster_token = delta::random_hex(32);
+        // P2-16: the generated token IS sensitive — print it exactly
+        // once so the operator can copy it, then never echo it again.
+        // Anything that later wants to log the token must redact via
+        // redact_secret() below.
         std::cerr
             << "[Delta][WARN] role=" << cfg.role
-            << " started without --cluster-token. Generated one:\n"
+            << " started without --cluster-token. Generated one (copy now, will not be reprinted):\n"
             << "             DELTA_CLUSTER_TOKEN=" << cfg.cluster_token << "\n"
             << "             Persist this value across restarts and on every peer,\n"
             << "             otherwise peer-to-peer auth will fail after the next restart."

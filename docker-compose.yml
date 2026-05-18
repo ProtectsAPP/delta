@@ -21,14 +21,22 @@ services:
     volumes:
       - delta-data:/data
     environment:
-      # Default admin credentials for first boot. Change before exposing.
-      - DELTA_ADMIN_USER=admin
-      - DELTA_ADMIN_PASS=change-me-in-production
-    healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "16888"]
-      interval: 15s
-      timeout: 3s
-      retries: 3
+      # P2-17: do NOT commit secrets here. Two safer patterns:
+      #   (a) host env / .env file kept out of git (see .gitignore)
+      #   (b) Docker secrets (Swarm / k8s) mounted under /run/secrets
+      #
+      # The values below are placeholders that pull from the shell env at
+      # `docker compose up` time. If unset, the container will refuse to
+      # boot — which is what you want in production. For a quick dev run
+      # use:  DELTA_ADMIN_PASS=admin docker compose up
+      - DELTA_ADMIN_USER=${DELTA_ADMIN_USER:-admin}
+      - DELTA_ADMIN_PASS=${DELTA_ADMIN_PASS:?DELTA_ADMIN_PASS must be set}
+      # Optional. Auto-generated at first boot if missing (and printed once).
+      - DELTA_CLUSTER_TOKEN=${DELTA_CLUSTER_TOKEN:-}
+    # P0-17: the runtime image is distroless and has no nc / shell, so the
+    # native healthcheck is removed. Use an external probe (k8s
+    # readinessProbe / docker stack health) hitting HTTP /api/v1/health
+    # on :16888 instead.
 
 volumes:
   delta-data:

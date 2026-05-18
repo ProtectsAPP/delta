@@ -23,3 +23,8 @@ vectors/
 /tmp/
 site/public/llms.txt
 ipv4_source.txt
+
+# P2-17: docker-compose secrets live in .env, never in git.
+.env
+.env.*
+!.env.example
